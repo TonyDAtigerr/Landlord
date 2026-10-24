@@ -21,7 +21,6 @@ triage, to other scanners (Nessus, nmap), and to the client.
 | `landlord.py` | python | Resolves hostnames and classifies each IP as in-scope, cloud (Azure/AWS/GCP), out of scope, or unresolved. Writes a client Excel report. |
 | `bscope.py` | python | Local web dashboard for triaging BBOT findings (severity, status, notes), plus an assets view and a screenshot gallery. |
 | `report.py` | python | Turns the findings you triaged in `bscope` into a client-ready HTML or Markdown report. |
-| `combine_recon.py` | python | Legacy helper from the older `ip2host` workflow. Not part of the BBOT pipeline; kept for reference. |
 
 ---
 
