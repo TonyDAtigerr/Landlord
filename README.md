@@ -212,7 +212,8 @@ confirmed,reported` or `--all` (everything except *new*).
 ## API keys (strongly recommended)
 
 Discovery quality scales with how many free API keys BBOT has. Add them under
-`modules:` in `~/.config/bbot/secrets.yml`:
+`modules:` in `~/.config/bbot/secrets.yml`. If you can't find that file, run
+`bbot --reset-secrets` to generate a fresh one, then edit it:
 
 ```yaml
 modules:
