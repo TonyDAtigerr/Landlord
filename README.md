@@ -65,6 +65,62 @@ chmod +x recon.sh landlord.py bscope.py report.py
 Keep all the scripts in one folder; `recon.sh` finds the others on your `PATH`
 or beside itself.
 
+### Optional: API keys (recommended before your first run)
+
+BBOT works with no keys at all, but discovery quality scales with how many
+free API keys it has — the passive phase pulls from every service you give it
+a key for. Set these up once, before your first engagement, and every run
+benefits.
+
+Add keys under `modules:` in `~/.config/bbot/secrets.yml`. If that file does
+not exist, run `bbot --reset-secrets` to generate a fresh one, then edit it:
+
+```yaml
+modules:
+  virustotal:
+    api_key: 'KEY'
+  chaos:
+    api_key: 'KEY'
+  otx:
+    api_key: 'KEY'
+  github_codesearch:
+    api_key: 'KEY'   # the same token also serves github_usersearch and github_org
+  # ... securitytrails, censys, leakix, bevigil, fullhunt, builtwith,
+  #     hunterio, postman, certspotter, shodan_dns
+```
+
+**Free keys worth getting** (each requires a free account):
+
+| Service | Sign up | Notes |
+| --- | --- | --- |
+| VirusTotal | <https://www.virustotal.com/> | Free public API |
+| ProjectDiscovery Chaos | <https://chaos.projectdiscovery.io/> | Free key |
+| AlienVault OTX | <https://otx.alienvault.com/> | Free key |
+| GitHub | <https://github.com/settings/tokens> | A classic token with **no** permissions checked. One token covers `github_codesearch`, `github_usersearch`, and `github_org`. |
+| SecurityTrails | <https://securitytrails.com/> | Free tier |
+| Censys | <https://search.censys.io/> | Free tier |
+| LeakIX | <https://leakix.net/> | Free key |
+| BeVigil | <https://bevigil.com/osint-api> | Free tier |
+| FullHunt | <https://fullhunt.io/> | Free tier |
+| BuiltWith | <https://api.builtwith.com/> | Free tier |
+| Hunter.io | <https://hunter.io/> | Free tier |
+| Postman | <https://www.postman.com/> | Free account key |
+| Certspotter (SSLMate CT Search API) | <https://sslmate.com/ct_search_api/> | Free tier |
+| Shodan | <https://account.shodan.io/> | Free account key. **Bonus:** Shodan occasionally runs a one-time-fee lifetime Membership sale (historically around Black Friday and other holidays) — well worth grabbing if you see it. |
+
+**Currently unavailable** (as of October 2026) — skip these, BBOT will simply
+not use the module:
+
+- **BufferOverrun** (`bufferoverrun` module) — the signup page returns
+  "Too many API Keys defined for this account. Limit is 10000", which is
+  BufferOverrun hitting its own provider's cap. No new keys are being issued.
+- **SubdomainRadar** (`subdomainradar` module) — the site shows "This service
+  is paused" and is not accepting scans, API requests, or new signups while it
+  changes ownership.
+
+> `secrets.yml` holds credentials — `chmod 600` it and keep it out of version
+> control. It's in `.gitignore` here already.
+
 ---
 
 ## Quick start
@@ -243,18 +299,29 @@ confirmed,reported` or `--all` (everything except *new*).
 
 ## API keys (strongly recommended)
 
-Discovery quality scales with how many API keys BBOT has, and all of the ones
-this kit relies on have a **free tier**. The exact list, with sign-up links and
-the option names BBOT expects, is in
-[`free_secrets.example.yml`](free_secrets.example.yml):
+Discovery quality scales with how many API keys BBOT has, and most of the
+services this kit relies on have a **free tier**. The option names BBOT expects
+are in [`free_secrets.example.yml`](free_secrets.example.yml); the table below
+adds a sign-up link for each:
 
-| Service | Service | Service |
+| Service | Sign up | Notes |
 | --- | --- | --- |
-| VirusTotal | ProjectDiscovery Chaos | AlienVault OTX |
-| GitHub (classic token, no scopes) | SecurityTrails | Censys |
-| LeakIX | BeVigil | FullHunt |
-| BuiltWith | hunter.io | Postman |
-| Trickest | Cert Spotter | GitLab |
+| VirusTotal | <https://www.virustotal.com/> | Free public API |
+| ProjectDiscovery Chaos | <https://chaos.projectdiscovery.io/> | Free key |
+| AlienVault OTX | <https://otx.alienvault.com/> | Free key |
+| GitHub | <https://github.com/settings/tokens> | Classic token with **no** scopes; one token covers `github_codesearch`, `github_usersearch`, `github_org` |
+| SecurityTrails | <https://securitytrails.com/> | Free tier |
+| Censys | <https://search.censys.io/> | Free tier |
+| LeakIX | <https://leakix.net/> | Free key |
+| BeVigil | <https://bevigil.com/osint-api> | Free tier |
+| FullHunt | <https://fullhunt.io/> | Free tier |
+| BuiltWith | <https://api.builtwith.com/> | Free tier |
+| hunter.io | <https://hunter.io/> | Free tier |
+| Postman | <https://www.postman.com/> | Free account key |
+| Trickest | <https://trickest.com/> | Free tier |
+| Cert Spotter | <https://sslmate.com/ct_search_api/> | SSLMate CT Search API, free tier |
+| GitLab | <https://gitlab.com/-/user_settings/personal_access_tokens> | Personal access token (`read_api`) |
+| Shodan | <https://account.shodan.io/> | Free account key. Shodan occasionally runs a one-time-fee **lifetime Membership** sale (historically around holidays) — worth grabbing if you see it. |
 
 Fill in your keys and install the file where BBOT reads it:
 
@@ -285,8 +352,17 @@ Keys can also be passed on the command line for a one-off run:
 > control. It's in `.gitignore` here already; only the `*.example.yml` templates are
 > committed.
 
----
+**Currently unavailable** (as of October 2026) — skip these; BBOT will simply
+not use the module:
 
+- **BufferOverrun** (`bufferoverrun` module) — the signup page returns
+  "Too many API Keys defined for this account. Limit is 10000", its provider
+  hitting its own cap. No new keys are being issued.
+- **SubdomainRadar** (`subdomainradar` module) — the site shows "This service
+  is paused" and is not accepting scans, API requests, or new signups while it
+  changes ownership.
+
+---
 ## Tuning the active scan
 
 The active scan has two built-in profiles, plus full manual control.
