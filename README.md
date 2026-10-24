@@ -90,6 +90,31 @@ pause.
 
 ---
 
+## `recon.sh` options
+
+Run `./recon.sh -h` for the built-in help. Full flag list:
+
+| Flag | Argument | What it does |
+| --- | --- | --- |
+| `-s` | FILE | **Required.** Authorized scope: IPs, CIDRs, or `a-b` ranges, one per line. Used as both the landlord scope and BBOT's scope. |
+| `-d` | FILE or DOMAIN | **Required, repeatable.** Seed domains: a file (one per line) or a literal domain. Mix files and domains freely. |
+| `-o` | DIR | Output directory (default: `recon_<date>`). |
+| `-c` | "Name" | Client name shown on the reports. |
+| `-a` | "Name" | Assessor / your company name shown on the reports. |
+| `--gcp` | | Also classify Google Cloud ranges in the scope report. |
+| `--passive-only` | | Stop after discovery and the scope report. No active scan. |
+| `--deep` | | Kitchen-sink active scan (see *Tuning the active scan* below). Loud and intrusive; authorized engagements only. |
+| `--active-preset` | "P ..." | Override the active-scan BBOT presets entirely. |
+| `--active-modules` | "M ..." | Override the active-scan BBOT modules entirely. |
+| `--no-config-tuning` | | Don't apply the quieter/faster active-scan config (WAF avoidance, bounded spider, etc.). |
+| `--dns-qps` | N | DNS queries/sec for brute forcing (default: 500). |
+| `--no-serve` | | Do everything but don't launch the bscope dashboard; prints the command to launch it yourself. |
+| `--bscope-port` | N | Port for the bscope dashboard (default: 7373). |
+| `-y` | | Non-interactive: skip the pause before the active scan. |
+| `-h` | | Show help. |
+
+---
+
 ## Output files
 
 Each run writes to an output folder (`recon_<date>` by default):
@@ -160,20 +185,36 @@ Search API), LeakIX, BeVigil, FullHunt, BuiltWith, Hunter, Postman.
 
 ## Tuning the active scan
 
-The default active scan balances coverage and noise. Adjust per engagement:
+The active scan has two built-in profiles, plus full manual control.
+
+**Standard (default).** Solid coverage without the loudest modules:
+presets `web-heavy nuclei web-screenshots`, modules `portscan fingerprintx baddns`.
 
 ```bash
-# Heavier: directory brute-force, param mining, light fuzzing (loud, slower)
-./recon.sh -s scope_ips.txt -d domains.txt \
-  --active-preset "web-heavy nuclei spider webbrute paramminer lightfuzz baddns-heavy web-screenshots"
+./recon.sh -s scope_ips.txt -d domains.txt
+```
 
-# Lighter: quick pass
+**Deep (`--deep`).** The kitchen-sink profile. On top of the standard presets it
+adds cloud-bucket enumeration, code/secret-leak enumeration, email enumeration,
+web spidering, directory brute-force (`webbrute`), parameter mining
+(`paramminer`), light fuzzing (`lightfuzz`), and all subdomain-takeover checks
+(`baddns-heavy`). This is loud and intrusive.
+
+```bash
+./recon.sh -s scope_ips.txt -d domains.txt --deep
+```
+
+> `--deep`, `lightfuzz`, and `webbrute` are intrusive and can trip a WAF or SOC.
+> Only use them when testing at that depth is explicitly authorized.
+
+**Manual override.** Replace the presets and/or modules outright for either
+profile with `--active-preset` and `--active-modules`:
+
+```bash
+# A lighter, quicker pass than the standard profile
 ./recon.sh -s scope_ips.txt -d domains.txt \
   --active-preset "web nuclei-budget web-screenshots" --active-modules "portscan"
 ```
-
-`lightfuzz` and `webbrute` are intrusive — only use the heavier presets when
-testing at that depth is authorized.
 
 ---
 
