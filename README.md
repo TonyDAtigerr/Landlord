@@ -85,6 +85,13 @@ python3 report.py recon_YYYYMMDD/03_active/active/output.json \
     --client "Client Name" --assessor "Your Company" -o client_report.html
 ```
 
+> **Where to get the seed domains and scope.** `scope_ips.txt` holds the
+> authorized IPs/CIDRs from the signed rules of engagement; `domains.txt` holds
+> the client's root domains. For how to source and confirm both inputs before a
+> run, follow the internal runbook:
+> [Asset Discovery & Scanning: The BBOT Workflow](https://www.notion.so/402e94c2f82f8117a407f1969db96854)
+> (Notion: Tony's Stuff → External Pentesting). *Private; access required.*
+
 `recon.sh` pauses once, before the active scan, and shows how many hosts it will
 touch. Use `--passive-only` to stop after the scope report, or `-y` to skip the
 pause.
