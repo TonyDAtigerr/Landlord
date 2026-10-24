@@ -1,0 +1,23 @@
+# Engagement output - contains client attack surface & findings. Never commit.
+recon_*/
+*.bscope.json
+scope_report.xlsx
+out_of_scope_*.xlsx
+client_report.*
+report.html
+report.md
+
+# Secrets
+secrets.yml
+*.key
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+*.swp
