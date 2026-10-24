@@ -1,5 +1,7 @@
 # External Recon Kit
 
+![Landlord — know who owns the address before you knock: discover, verify scope, active scan, triage, report](assets/landlord-workflow.png)
+
 A BBOT-powered toolkit for external penetration testing — from "the client gave
 me a few domains" to a triaged, client-ready findings report. It discovers the
 full external attack surface, verifies scope against your authorization and the
