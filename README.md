@@ -56,8 +56,8 @@ domains ─▶ 1. DISCOVER ─▶ 2. VERIFY SCOPE ─▶ 3. ACTIVE SCAN ─▶ 4
 ### Install
 
 ```bash
-git clone <your-repo-url> recon-kit
-cd recon-kit
+git clone https://github.com/TonyDAtigerr/Landlord.git
+cd Landlord
 pip install -r requirements.txt
 chmod +x recon.sh landlord.py bscope.py report.py
 ```
