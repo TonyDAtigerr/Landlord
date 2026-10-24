@@ -85,16 +85,57 @@ python3 report.py recon_YYYYMMDD/03_active/active/output.json \
     --client "Client Name" --assessor "Your Company" -o client_report.html
 ```
 
-> **Where to get the seed domains and scope.** `scope_ips.txt` holds the
-> authorized IPs/CIDRs from the signed rules of engagement; `domains.txt` holds
-> the client's root domains. For how to source and confirm both inputs before a
-> run, follow the internal runbook:
-> [Asset Discovery & Scanning: The BBOT Workflow](https://www.notion.so/402e94c2f82f8117a407f1969db96854)
-> (Notion: Tony's Stuff → External Pentesting). *Private; access required.*
-
 `recon.sh` pauses once, before the active scan, and shows how many hosts it will
 touch. Use `--passive-only` to stop after the scope report, or `-y` to skip the
 pause.
+
+---
+
+## Finding the client's root domains
+
+Everything starts from `domains.txt`. These become BBOT's seeds, so accuracy
+beats size — a wrong domain pulls unrelated infrastructure into the scan. Work
+the sources in this order, best first:
+
+**1. Ask the client at kickoff.** Anything they hand you is authoritative; start there.
+
+**2. Microsoft 365 tenant domains.** For each domain you already know, list the
+others registered in the same tenant:
+
+```bash
+curl -s "https://azmap.dev/api/tenant?domain=example.com&extract=true"
+```
+
+**3. Shared certificates.** Root domains that show up on certificates alongside a
+known one, most common first (ignore CDN and certificate-provider domains):
+
+```bash
+curl -s "https://crt.sh/?q=example.com&output=json" | jq -r '.[].name_value' \
+  | tr 'A-Z' 'a-z' | sed 's/^\*\.//' | awk -F. '{print $(NF-1) "." $NF}' \
+  | sort | uniq -c | sort -rn
+```
+
+**4. Reverse WHOIS by registrant email.** Every domain registered with the same
+address (needs a Whoxy API key in `$WHOXY_KEY`):
+
+```bash
+curl -s "https://api.whoxy.com/?key=$WHOXY_KEY&reverse=whois&email=domains@example.com" \
+  | jq -r '.search_result[].domain_name'
+```
+
+**5. The client's own websites.** Footers, "our brands" pages, and privacy
+policies often list sister domains.
+
+**Verify before adding.** For anything that didn't come straight from the client,
+look for at least two signs it's really theirs: shared name servers
+(`dig +short NS <domain>`), shared mail (`dig +short MX <domain>`), it resolves
+into their IP ranges, or it shares a certificate with a known domain. A large
+corporate group can own domains that belong to separate businesses with their
+own contracts, so when coverage is unclear, confirm with the client first.
+
+Put the confirmed domains in `domains.txt` (one per line) and your authorized IP
+ranges in `scope_ips.txt` (IPs, CIDRs, or `a-b` ranges, one per line). Then run
+the pipeline as shown above.
 
 ---
 
