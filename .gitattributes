@@ -1,0 +1,14 @@
+# Force Unix (LF) line endings on everything Git treats as text, regardless of
+# the core.autocrlf setting on the machine that checks the repo out. A Windows
+# checkout copied to Linux otherwise lands with CRLF endings and bash fails with
+# "$'\r': command not found".
+* text=auto eol=lf
+
+# Scripts must always be LF
+*.sh  text eol=lf
+*.py  text eol=lf
+
+# Binary assets, never touched
+*.png binary
+*.jpg binary
+*.gif binary
