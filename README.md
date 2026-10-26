@@ -45,7 +45,7 @@ domains ─▶ 1. DISCOVER ─▶ 2. VERIFY SCOPE ─▶ 3. ACTIVE SCAN ─▶ 4
 
 ## Requirements
 
-- **BBOT 3.x** — `pipx install bbot`. Add API keys to `~/.config/bbot/secrets.yml` for far better discovery; `secrets.example.yml` lists the free ones (see *API keys* below).
+- **BBOT 3.x** — `pipx install bbot`. Add API keys to `~/.config/bbot/secrets.yml` for far better discovery; `free_secrets.example.yml` lists the free ones (see *API keys* below).
 - **Python 3.7+** and, for `landlord.py`:
   ```bash
   pip install -r requirements.txt   # netaddr, requests, openpyxl
@@ -214,7 +214,7 @@ confirmed,reported` or `--all` (everything except *new*).
 Discovery quality scales with how many API keys BBOT has, and all of the ones
 this kit relies on have a **free tier**. The exact list, with sign-up links and
 the option names BBOT expects, is in
-[`secrets.example.yml`](secrets.example.yml):
+[`free_secrets.example.yml`](free_secrets.example.yml):
 
 | Service | Service | Service |
 | --- | --- | --- |
@@ -227,15 +227,20 @@ the option names BBOT expects, is in
 Fill in your keys and install the file where BBOT reads it:
 
 ```bash
-cp secrets.example.yml ~/.config/bbot/secrets.yml
+cp free_secrets.example.yml ~/.config/bbot/secrets.yml
 chmod 600 ~/.config/bbot/secrets.yml
 ```
 
 The values in the template are fakes and will not work until replaced.
 
-**Have a paid API key?** If you pay for a service that is not in the template
-(Shodan, DeHashed, BufferOverrun, c99, ...), generate BBOT's full secrets file,
-which lists every module option, and add the key there:
+**Have a paid API key?** [`full_secrets.example.yml`](full_secrets.example.yml)
+is the same template with **every** secret option BBOT 3.x knows about: the
+free keys above, the paid services (Shodan, DeHashed, BufferOverrun, c99,
+IPStack, IP2Location, SubDomainRadar, Trajan tokens, ...), the output-module
+credentials (Elastic, Neo4j, Splunk, Slack, Teams, ...), and the global
+`bbot_io_api_key` / `interactsh_token`. Delete every entry you don't have a
+real value for before using it. You can also have BBOT generate its own fully
+commented version of that file:
 
 ```bash
 bbot --reset-secrets   # regenerates ~/.config/bbot/secrets.yml, backs up the old one to .bak
@@ -245,7 +250,7 @@ Keys can also be passed on the command line for a one-off run:
 `bbot -c modules.shodan_dns.api_key=KEY`.
 
 > `secrets.yml` holds credentials. `chmod 600` it and keep it out of version
-> control. It's in `.gitignore` here already; only the `.example` template is
+> control. It's in `.gitignore` here already; only the `*.example.yml` templates are
 > committed.
 
 ---
