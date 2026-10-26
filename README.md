@@ -45,7 +45,7 @@ domains ─▶ 1. DISCOVER ─▶ 2. VERIFY SCOPE ─▶ 3. ACTIVE SCAN ─▶ 4
 
 ## Requirements
 
-- **BBOT 3.x** — `pipx install bbot`. Add API keys to `~/.config/bbot/secrets.yml` for far better discovery (see *API keys* below).
+- **BBOT 3.x** — `pipx install bbot`. Add API keys to `~/.config/bbot/secrets.yml` for far better discovery; `secrets.example.yml` lists the free ones (see *API keys* below).
 - **Python 3.7+** and, for `landlord.py`:
   ```bash
   pip install -r requirements.txt   # netaddr, requests, openpyxl
@@ -211,25 +211,42 @@ confirmed,reported` or `--all` (everything except *new*).
 
 ## API keys (strongly recommended)
 
-Discovery quality scales with how many free API keys BBOT has. Add them under
-`modules:` in `~/.config/bbot/secrets.yml`. If you can't find that file, run
-`bbot --reset-secrets` to generate a fresh one, then edit it:
+Discovery quality scales with how many API keys BBOT has, and all of the ones
+this kit relies on have a **free tier**. The exact list, with sign-up links and
+the option names BBOT expects, is in
+[`secrets.example.yml`](secrets.example.yml):
 
-```yaml
-modules:
-  virustotal:
-    api_key: 'KEY'
-  chaos:
-    api_key: 'KEY'
-  # ... otx, securitytrails, github_codesearch, censys_dns, certspotter, etc.
+| Service | Service | Service |
+| --- | --- | --- |
+| VirusTotal | ProjectDiscovery Chaos | AlienVault OTX |
+| GitHub (classic token, no scopes) | SecurityTrails | Censys |
+| LeakIX | BeVigil | FullHunt |
+| BuiltWith | hunter.io | Postman |
+| Trickest | Cert Spotter | GitLab |
+
+Fill in your keys and install the file where BBOT reads it:
+
+```bash
+cp secrets.example.yml ~/.config/bbot/secrets.yml
+chmod 600 ~/.config/bbot/secrets.yml
 ```
 
-Free keys worth getting: VirusTotal, ProjectDiscovery Chaos, AlienVault OTX,
-GitHub (a no-permission classic token), SecurityTrails, Censys, Cert Spotter (CT
-Search API), LeakIX, BeVigil, FullHunt, BuiltWith, Hunter, Postman.
+The values in the template are fakes and will not work until replaced.
 
-> `secrets.yml` holds credentials — `chmod 600` it and keep it out of version
-> control. It's in `.gitignore` here already.
+**Have a paid API key?** If you pay for a service that is not in the template
+(Shodan, DeHashed, BufferOverrun, c99, ...), generate BBOT's full secrets file,
+which lists every module option, and add the key there:
+
+```bash
+bbot --reset-secrets   # regenerates ~/.config/bbot/secrets.yml, backs up the old one to .bak
+```
+
+Keys can also be passed on the command line for a one-off run:
+`bbot -c modules.shodan_dns.api_key=KEY`.
+
+> `secrets.yml` holds credentials. `chmod 600` it and keep it out of version
+> control. It's in `.gitignore` here already; only the `.example` template is
+> committed.
 
 ---
 
