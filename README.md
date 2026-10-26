@@ -323,6 +323,46 @@ profile with `--active-preset` and `--active-modules`:
 
 ## Safety & operating notes
 
+### Cert Spotter is slow with an API key, and that's expected
+
+Near the end of the passive scan you will likely see BBOT sit on one module for
+a long time:
+
+```
+[INFO] passive: Modules running (incoming:processing:outgoing) certspotter(81:1:0)
+[INFO] passive: No events in queue (0 processed in the past 15 seconds)
+```
+
+This is not a hang. With an SSLMate key configured, BBOT's `certspotter` module
+changes behaviour:
+
+- **Without a key** it makes one request per domain and takes whatever comes
+  back in that single page.
+- **With a key** it pages through the domain's *entire* certificate history,
+  requesting the next page until Cert Spotter returns nothing. SSLMate
+  throttles authenticated requests by subscription level; BBOT waits out each
+  throttle and carries on.
+
+So the key is working, and it is the reason the module is slow: it is pulling
+the client's full certificate history rather than a sample. That is the result
+you want from passive discovery.
+
+The queue number (`81` above) is mostly subdomains found by other modules. The
+module deduplicates to the highest parent domain, so nearly all of them are
+dropped the moment they are picked up. The `1` is a single root domain being
+paged through. You are waiting on a handful of lookups, not 81.
+
+Your options, in order of preference:
+
+1. **Let it finish.** Every other module is done by this point, and this is the
+   thorough result.
+2. **Remove the `certspotter` key** from `~/.config/bbot/secrets.yml`. The module
+   drops back to one quick request per domain. Faster, less complete.
+3. **Exclude the module** by editing the passive scan line in `recon.sh`
+   (`-em viewdns certspotter`). Only sensible if the `crt` module is working,
+   since that is BBOT's other certificate-transparency source and it fails
+   often because crt.sh times out.
+
 - **Keep the authorization paper trail** (signed scope / email) in the engagement folder.
 - **Update nuclei templates** before each engagement: `nuclei -update-templates`.
 - **Refresh cloud ranges** for a formal assessment: `landlord.py ... --refresh` (cached ~7 days otherwise).
