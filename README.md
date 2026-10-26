@@ -100,27 +100,58 @@ the sources in this order, best first:
 **1. Ask the client at kickoff.** Anything they hand you is authoritative; start there.
 
 **2. Microsoft 365 tenant domains.** For each domain you already know, list the
-others registered in the same tenant:
+others registered in the same tenant. This appends every tenant domain to
+`domains.txt`, lowercased, sorted and deduplicated:
 
 ```bash
-curl -s "https://azmap.dev/api/tenant?domain=example.com&extract=true"
+curl -s "https://azmap.dev/api/tenant?domain=example.com&extract=true" \
+  | jq -r '.related_domains[]?' | tr 'A-Z' 'a-z' >> domains.txt \
+  && sort -u -o domains.txt domains.txt && cat domains.txt
+```
+
+Already have a few confirmed domains in `domains.txt`? Expand all of them in
+one go (the loop reads the file once before it starts appending):
+
+```bash
+for d in $(grep -v '^#' domains.txt); do
+  curl -s "https://azmap.dev/api/tenant?domain=$d&extract=true" | jq -r '.related_domains[]?'
+done | tr 'A-Z' 'a-z' >> domains.txt && sort -u -o domains.txt domains.txt && cat domains.txt
 ```
 
 **3. Shared certificates.** Root domains that show up on certificates alongside a
-known one, most common first (ignore CDN and certificate-provider domains):
+known one. Certificates often carry CDN, hosting and certificate-provider names
+too, so this one goes through a review file first instead of straight into
+`domains.txt`. Step one writes the candidates, most common first:
 
 ```bash
 curl -s "https://crt.sh/?q=example.com&output=json" | jq -r '.[].name_value' \
-  | tr 'A-Z' 'a-z' | sed 's/^\*\.//' | awk -F. '{print $(NF-1) "." $NF}' \
-  | sort | uniq -c | sort -rn
+  | tr 'A-Z' 'a-z' | sed 's/^\*\.//' | grep -E '^[a-z0-9.-]+$' \
+  | awk -F. 'NF >= 2 {print $(NF-1) "." $NF}' \
+  | sort | uniq -c | sort -rn | tee crtsh_candidates.txt
 ```
 
-**4. Reverse WHOIS by registrant email.** Every domain registered with the same
-address (needs a Whoxy API key in `$WHOXY_KEY`):
+Delete the lines you don't want from `crtsh_candidates.txt` (CDNs, cert
+providers, anything that isn't the client), then step two appends the keepers
+to `domains.txt`, deduplicated:
 
 ```bash
-curl -s "https://api.whoxy.com/?key=$WHOXY_KEY&reverse=whois&email=domains@example.com" \
-  | jq -r '.search_result[].domain_name'
+awk '{print $2}' crtsh_candidates.txt >> domains.txt \
+  && sort -u -o domains.txt domains.txt && cat domains.txt
+```
+
+> Domains under a two-part public suffix (`client.co.uk`, `client.com.au`) come
+> out as the bare suffix (`co.uk`). Add those by hand.
+
+**4. Reverse WHOIS by registrant email.** Every domain registered with the same
+address (needs a Whoxy API key in `$WHOXY_KEY`). Whoxy pages its results, so
+this walks every page and appends the domains to `domains.txt`, lowercased,
+sorted and deduplicated:
+
+```bash
+Q="https://api.whoxy.com/?key=$WHOXY_KEY&reverse=whois&email=domains@example.com"
+for page in $(seq 1 "$(curl -s "$Q&page=1" | jq -r '.total_pages // 1')"); do
+  curl -s "$Q&page=$page" | jq -r '.search_result[]?.domain_name'
+done | tr 'A-Z' 'a-z' >> domains.txt && sort -u -o domains.txt domains.txt && cat domains.txt
 ```
 
 **5. The client's own websites.** Footers, "our brands" pages, and privacy
