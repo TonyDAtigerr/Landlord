@@ -1133,6 +1133,21 @@ class Store:
 #  Export (markdown report of triaged findings)
 # --------------------------------------------------------------------------- #
 
+def collect_emails(events):
+    """Unique, lowercased email addresses discovered in the scan (BBOT
+    EMAIL_ADDRESS events), sorted. Intended to be exported and fed into
+    user-enumeration tools (onedrive_user_enum, o365enum, etc.)."""
+    rx = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+    seen = {}
+    for ev in events:
+        if ev.get("type") != "EMAIL_ADDRESS":
+            continue
+        blob = (ev.get("data_str", "") or "") + " " + (ev.get("host", "") or "")
+        for m in rx.findall(blob):
+            seen[m.strip().lower()] = True
+    return sorted(seen)
+
+
 def build_markdown(events, store):
     by_sev = {}
     for ev in events:
@@ -1363,6 +1378,7 @@ summary:hover>.caret{color:var(--accent);}
     <button class="tab" data-tab="hosts">Hosts</button>
     <button class="tab" data-tab="findings">Findings</button>
     <button class="tab" data-tab="assets">Assets</button>
+    <button class="tab" data-tab="emails">Emails</button>
     <button class="tab" data-tab="shots">Screenshots</button>
   </div>
   <input class="search" id="search" placeholder="filter (host, text, module, type)...  press /" autocomplete="off">
@@ -1372,6 +1388,7 @@ summary:hover>.caret{color:var(--accent);}
       <a href="/api/export?fmt=md" target="_blank">Report (Markdown)</a>
       <a href="/api/export?fmt=csv" target="_blank">All events (CSV)</a>
       <a href="/api/export?fmt=json" target="_blank">All events (JSON)</a>
+      <a href="/api/export?fmt=emails" target="_blank">Emails (.txt)</a>
     </div>
   </div>
 </header>
@@ -1380,6 +1397,7 @@ summary:hover>.caret{color:var(--accent);}
   <section id="view-hosts" style="display:none"></section>
   <section id="view-findings" style="display:none"></section>
   <section id="view-assets" style="display:none"></section>
+  <section id="view-emails" style="display:none"></section>
   <section id="view-shots" style="display:none"></section>
 </main>
 <div class="lb" id="lb">
@@ -1402,7 +1420,7 @@ const SMAP = {}; STATUSES.forEach(s=>SMAP[s.key]=s);
 const SHOTST = CFG.shotStatuses||[]; const SHOTSMAP = {}; SHOTST.forEach(s=>SHOTSMAP[s.key]=s);
 let shotFilter='all';
 const BANDS = ['info','low','medium','high','critical'];  // index 1..5 via rank
-let DATA={findings:[],assets:[],removed:[]}, SHOTS=[], SHOTMAP={}, TECHMAP={}, TAB='overview';
+let DATA={findings:[],assets:[],emails:[],removed:[]}, SHOTS=[], SHOTMAP={}, TECHMAP={}, TAB='overview';
 let sevFilter=new Set(), statusFilter=new Set(), typeFilter='';
 let juicyOnly=false, newOnly=false, groupSimilar=false, selIdx=-1;
 const GROUP_LIMIT=40;              // affected targets shown before "show all"
@@ -1416,6 +1434,7 @@ function toast(m){const t=document.getElementById('toast');t.textContent=m;t.cla
   clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),1400);}
 function copy(txt){navigator.clipboard.writeText(txt).then(()=>toast('copied'),()=>toast('copy failed'));}
 function q(){return document.getElementById('search').value.toLowerCase().trim();}
+function setSearch(v){const el=document.getElementById('search');el.value=v;rerender();}
 function rankBand(r){return BANDS[Math.max(0,Math.min(5,r)-1)]||'info';}
 function fmt(n){if(!n)return'';const u=['B','KB','MB'];let i=0,v=n;while(v>=1024&&i<2){v/=1024;i++;}return v.toFixed(v<10&&i>0?1:0)+u[i];}
 
@@ -1861,14 +1880,45 @@ function toggleAsset(id){const r=document.getElementById('ax-'+id);if(r)r.style.
 function toggleJuicy(){juicyOnly=!juicyOnly;rerender();}
 function toggleNew(){newOnly=!newOnly;rerender();}
 function toggleGroup(){groupSimilar=!groupSimilar;selIdx=-1;renderFindings();}
-function rerender(){if(TAB==='findings')renderFindings();else if(TAB==='assets')renderAssets();else if(TAB==='hosts')renderHosts();else if(TAB==='shots')renderShots();}
+/* ---------------- EMAILS ---------------- */
+function copyEmails(){copy((DATA.emails||[]).join('\n'));toast((DATA.emails||[]).length+' emails copied');}
+function renderEmails(){
+  const all=DATA.emails||[];const s=q();
+  const list=s?all.filter(e=>e.toLowerCase().includes(s)):all;
+  let h='<div class="bar">';
+  h+=`<span class="muted">${all.length} email${all.length===1?'':'s'} found${s?(' &middot; '+list.length+' shown'):''}</span>`;
+  if(all.length){
+    h+=`<span class="chip" onclick="copyEmails()">&#128203; copy all</span>`;
+    h+=`<a class="chip" href="/api/export?fmt=emails" download="emails.txt" style="text-decoration:none">&#11015; download .txt</a>`;}
+  h+='</div>';
+  if(!all.length){
+    h+='<div class="empty">No emails discovered. Run bbot with email modules '
+      +'(<span class="kbd">emailformat</span>, <span class="kbd">pgp</span>, '
+      +'<span class="kbd">skymem</span>, <span class="kbd">hunterio</span>, '
+      +'<span class="kbd">dehashed</span>&hellip;) to populate this.</div>';
+    document.getElementById('view-emails').innerHTML=h;return;}
+  h+='<p class="muted" style="margin:-4px 0 10px">Deduplicated addresses. Export the .txt and feed it into user-enumeration tools (onedrive_user_enum, o365enum, &hellip;).</p>';
+  const byDom={};all.forEach(e=>{const d=(e.split('@')[1]||'?');byDom[d]=(byDom[d]||0)+1;});
+  h+='<div class="bar">';Object.entries(byDom).sort((a,b)=>b[1]-a[1]).forEach(([d,c])=>
+    h+=`<span class="chip" onclick="setSearch('@'+${JSON.stringify(d)})">${esc(d)} <span class="muted">${c}</span></span>`);
+  h+='</div>';
+  if(!list.length){h+='<div class="empty">No emails matched.</div>';document.getElementById('view-emails').innerHTML=h;return;}
+  h+='<table><thead><tr><th>#</th><th>Email</th><th>Domain</th></tr></thead><tbody>';
+  list.forEach((e,i)=>{const dom=e.split('@')[1]||'';
+    h+=`<tr><td class="muted">${i+1}</td><td class="mono" style="cursor:pointer" title="copy" onclick="${hx('copy('+JSON.stringify(e)+')')}">${esc(e)} &#128203;</td><td class="muted">${esc(dom)}</td></tr>`;});
+  h+='</tbody></table>';
+  document.getElementById('view-emails').innerHTML=h;
+}
+
+function rerender(){if(TAB==='findings')renderFindings();else if(TAB==='assets')renderAssets();else if(TAB==='hosts')renderHosts();else if(TAB==='emails')renderEmails();else if(TAB==='shots')renderShots();}
 
 function show(tab){TAB=tab;selIdx=-1;
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
-  ['overview','hosts','findings','assets','shots'].forEach(t=>
+  ['overview','hosts','findings','assets','emails','shots'].forEach(t=>
     document.getElementById('view-'+t).style.display=(t===tab?'':'none'));
   if(tab==='overview')renderOverview();else if(tab==='hosts')renderHosts();
   else if(tab==='findings')renderFindings();else if(tab==='assets')renderAssets();
+  else if(tab==='emails')renderEmails();
   else if(tab==='shots')renderShots();
 }
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>show(b.dataset.tab));
@@ -1907,7 +1957,7 @@ Promise.all([
   fetch('/api/findings').then(r=>r.json()),
   fetch('/api/screenshots').then(r=>r.json()).catch(()=>[])
 ]).then(([d,shots])=>{
-  DATA=d;DATA.removed=d.removed||[];
+  DATA=d;DATA.removed=d.removed||[];DATA.emails=d.emails||[];
   SHOTS=shots.map(it=>({...it,status:it.status||'new',src:'/img/'+it.rel.split('/').map(encodeURIComponent).join('/')}));
   SHOTMAP={};SHOTS.forEach(it=>{const h=shotHostOf(it);if(h&&!SHOTMAP[h])SHOTMAP[h]=it;});
   TECHMAP={};[...DATA.findings,...DATA.assets].forEach(ev=>{
@@ -1971,6 +2021,7 @@ class Handler(BaseHTTPRequestHandler):
             payload = {
                 "findings": [self._client_event(e) for e in self.findings],
                 "assets": [self._client_event(e) for e in self.assets],
+                "emails": collect_emails(self.events),
                 "removed": self.removed,
             }
             return self._send(200, json.dumps(payload), ctype="application/json; charset=utf-8")
@@ -1993,6 +2044,12 @@ class Handler(BaseHTTPRequestHandler):
                 body = build_csv_export(self.events, self.store)
                 return self._send(200, body, ctype="text/csv; charset=utf-8",
                                   extra={"Content-Disposition": "attachment; filename=bscope-export.csv"})
+            if fmt in ("emails", "email", "txt"):
+                body = "\n".join(collect_emails(self.events))
+                if body:
+                    body += "\n"
+                return self._send(200, body, ctype="text/plain; charset=utf-8",
+                                  extra={"Content-Disposition": "attachment; filename=emails.txt"})
             md = build_markdown(self.events, self.store)
             return self._send(200, md, ctype="text/markdown; charset=utf-8",
                               extra={"Content-Disposition": "attachment; filename=bscope-report.md"})
