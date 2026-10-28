@@ -2003,7 +2003,11 @@ function show(tab){TAB=tab;selIdx=-1;
   else if(tab==='meta')renderMeta();
 }
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>show(b.dataset.tab));
-document.getElementById('search').addEventListener('input',()=>schedule('search',rerender,180));
+document.getElementById('search').addEventListener('input',()=>{
+  // Overview has no searchable list; jump to Findings so a query always shows results.
+  if(q()&&TAB==='overview'){show('findings');return;}
+  schedule('search',rerender,180);
+});
 
 /* export menu */
 const exBtn=document.getElementById('exBtn'),exMenu=document.getElementById('exMenu');
