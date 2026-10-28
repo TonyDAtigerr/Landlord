@@ -699,6 +699,16 @@ def _sev_from(blob, tags):
     return None
 
 
+def _embedded_severity(text):
+    """A real severity stated inside a finding's text, e.g. retire.js writes
+    'Severity: CRITICAL' in the description while BBOT hardcodes the event
+    severity to INFO. Requires the literal 'severity: <level>' form so it can't
+    false-match an unrelated bracketed word. Returns the level or None."""
+    m = re.search(r"severity[:=]\s*\[?\s*(critical|high|medium|low|info)\b",
+                  (text or "").lower())
+    return m.group(1) if m else None
+
+
 def _target_bits(type_, data_str, host_hint, url_hint):
     """Extract host / url / port / scheme from an event."""
     host = host_hint or ""
@@ -760,6 +770,12 @@ def _normalize(type_, data, module, tags, ip="", resolved=None):
     tags = list(tags or [])
     if severity is None:
         severity = _sev_from(data_str + " " + " ".join(map(str, tags)), tags)
+
+    # honor a higher severity stated in the finding text (retirejs et al. pin the
+    # event severity to INFO but put the real one in the description) - upgrade only
+    embedded = _embedded_severity(data_str)
+    if embedded and SEV_RANK.get(embedded, 0) > SEV_RANK.get(severity or "", 0):
+        severity = embedded
 
     host, url, port, scheme = _target_bits(type_, data_str, host, url)
 
@@ -840,11 +856,13 @@ def parse_ndjson(path):
         if not isinstance(r, dict):
             continue
         rh = r.get("resolved_hosts") if isinstance(r.get("resolved_hosts"), list) else []
-        events.append(_normalize(
+        ev = _normalize(
             r.get("type", "UNKNOWN"), r.get("data", ""),
             r.get("module", ""), r.get("tags", []),
             ip=(rh[0] if rh else ""), resolved=rh,
-        ))
+        )
+        ev["raw"] = r                      # keep the full BBOT record for the Metadata tab
+        events.append(ev)
     return events
 
 
@@ -859,7 +877,9 @@ def parse_csv(path):
             ip = (row.get("IP Address") or "").strip()
             tags_raw = (row.get("Event Tags") or row.get("tags") or "").strip()
             tags = [t for t in re.split(r"[,\s]+", tags_raw) if t]
-            events.append(_normalize(type_, data, module, tags, ip=ip))
+            ev = _normalize(type_, data, module, tags, ip=ip)
+            ev["raw"] = dict(row)          # keep the original row for the Metadata tab
+            events.append(ev)
     return events
 
 
@@ -1138,6 +1158,24 @@ class Store:
 #  Export (markdown report of triaged findings)
 # --------------------------------------------------------------------------- #
 
+def meta_row(ev):
+    """Compact descriptor + the full captured record for the Metadata tab."""
+    tgt = ev.get("url") or ""
+    if not tgt:
+        h = ev.get("dhost") or ev.get("host") or ""
+        tgt = ("%s:%s" % (h, ev["port"])) if (h and ev.get("port")) else h
+    return {
+        "id": ev.get("id", ""), "type": ev.get("type", ""),
+        "module": ev.get("module", ""), "tags": ev.get("tags", []),
+        "target": tgt, "priority": ev.get("priority", ""),
+        "title": ev.get("title", ""),
+        "raw": ev.get("raw") if ev.get("raw") is not None else {
+            "type": ev.get("type", ""), "data": ev.get("data_str", ""),
+            "module": ev.get("module", ""), "tags": ev.get("tags", []),
+        },
+    }
+
+
 def collect_emails(events):
     """Unique, lowercased email addresses discovered in the scan (BBOT
     EMAIL_ADDRESS events), sorted. Intended to be exported and fed into
@@ -1328,6 +1366,7 @@ td.mono{font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all;}
 border:1px solid var(--accent2);border-radius:8px;padding:8px 16px;font-size:13px;opacity:0;
 transition:opacity .2s;pointer-events:none;z-index:200;}
 .toast.show{opacity:1;}
+.rawjson{white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,monospace;font-size:12px;line-height:1.45;margin:8px 0;padding:10px;max-height:460px;overflow:auto;background:var(--panel2);border:1px solid var(--line);border-radius:6px;}
 .kbd{font-family:ui-monospace,monospace;font-size:11px;background:var(--panel2);border:1px solid var(--line);
 border-radius:4px;padding:1px 5px;color:var(--muted);}
 .star{color:#ffc93c;font-size:13px;}
@@ -1385,6 +1424,7 @@ summary:hover>.caret{color:var(--accent);}
     <button class="tab" data-tab="assets">Assets</button>
     <button class="tab" data-tab="emails">Emails</button>
     <button class="tab" data-tab="shots">Screenshots</button>
+    <button class="tab" data-tab="meta">Metadata</button>
   </div>
   <input class="search" id="search" placeholder="filter (host, text, module, type)...  press /" autocomplete="off">
   <div class="exwrap">
@@ -1404,6 +1444,7 @@ summary:hover>.caret{color:var(--accent);}
   <section id="view-assets" style="display:none"></section>
   <section id="view-emails" style="display:none"></section>
   <section id="view-shots" style="display:none"></section>
+  <section id="view-meta" style="display:none"></section>
 </main>
 <div class="lb" id="lb">
   <div class="lb-bar"><button class="btn" id="lbPrev">&larr;</button>
@@ -1885,6 +1926,40 @@ function toggleAsset(id){const r=document.getElementById('ax-'+id);if(r)r.style.
 function toggleJuicy(){juicyOnly=!juicyOnly;rerender();}
 function toggleNew(){newOnly=!newOnly;rerender();}
 function toggleGroup(){groupSimilar=!groupSimilar;selIdx=-1;renderFindings();}
+/* ---------------- METADATA (raw BBOT records) ---------------- */
+let META=null, METALOADED=false;
+function toggleMeta(i){const r=document.getElementById('mx-'+i);if(r)r.style.display=(r.style.display==='none'?'':'none');}
+function renderMeta(){
+  const el=document.getElementById('view-meta');
+  if(!METALOADED){
+    el.innerHTML='<div class="empty">Loading metadata&hellip;</div>';
+    fetch('/api/raw').then(r=>r.json()).then(d=>{META=d;METALOADED=true;if(TAB==='meta')renderMeta();})
+      .catch(()=>{el.innerHTML='<div class="empty">Failed to load metadata.</div>';});
+    return;}
+  const s=q();
+  let list=META;
+  if(s)list=META.filter(m=>(m.type||'').toLowerCase().includes(s)||(m.module||'').toLowerCase().includes(s)
+    ||(m.target||'').toLowerCase().includes(s)||JSON.stringify(m.raw).toLowerCase().includes(s));
+  const byType={};META.forEach(m=>byType[m.type]=(byType[m.type]||0)+1);
+  let h='<div class="bar"><span class="muted">'+META.length+' events'+(s?(' &middot; '+list.length+' shown'):'')+'</span>';
+  h+='<a class="chip" href="/api/export?fmt=json" target="_blank" style="text-decoration:none">&#11015; full JSON</a></div>';
+  h+='<div class="bar">';Object.entries(byType).sort((a,b)=>b[1]-a[1]).forEach(([t,c])=>
+    h+=`<span class="chip" onclick="setSearch(${JSON.stringify(t)})">${esc(t)} <span class="muted">${c}</span></span>`);
+  h+='</div>';
+  h+='<p class="muted" style="margin:-4px 0 10px">Every field BBOT captured for each event, after dedupe. Click a row to expand the full raw record.</p>';
+  if(!list.length){h+='<div class="empty">No events matched.</div>';el.innerHTML=h;return;}
+  h+='<table><thead><tr><th>Type</th><th>Target</th><th>Module</th><th>Tags</th></tr></thead><tbody>';
+  list.forEach((m,i)=>{
+    h+=`<tr style="cursor:pointer" onclick="toggleMeta(${i})"><td>${esc(m.type)}</td>`
+      +`<td class="mono">${esc(m.target||'')}</td><td class="muted">${esc(m.module||'-')}</td>`
+      +`<td class="muted">${esc((m.tags||[]).join(', '))}</td></tr>`;
+    h+=`<tr id="mx-${i}" style="display:none"><td colspan="4" style="background:var(--panel)">`
+      +`<pre class="rawjson">${esc(JSON.stringify(m.raw,null,2))}</pre></td></tr>`;
+  });
+  h+='</tbody></table>';
+  el.innerHTML=h;
+}
+
 /* ---------------- EMAILS ---------------- */
 function copyEmails(){copy((DATA.emails||[]).join('\n'));toast((DATA.emails||[]).length+' emails copied');}
 function renderEmails(){
@@ -1915,16 +1990,17 @@ function renderEmails(){
   document.getElementById('view-emails').innerHTML=h;
 }
 
-function rerender(){if(TAB==='findings')renderFindings();else if(TAB==='assets')renderAssets();else if(TAB==='hosts')renderHosts();else if(TAB==='emails')renderEmails();else if(TAB==='shots')renderShots();}
+function rerender(){if(TAB==='findings')renderFindings();else if(TAB==='assets')renderAssets();else if(TAB==='hosts')renderHosts();else if(TAB==='emails')renderEmails();else if(TAB==='shots')renderShots();else if(TAB==='meta')renderMeta();}
 
 function show(tab){TAB=tab;selIdx=-1;
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
-  ['overview','hosts','findings','assets','emails','shots'].forEach(t=>
+  ['overview','hosts','findings','assets','emails','shots','meta'].forEach(t=>
     document.getElementById('view-'+t).style.display=(t===tab?'':'none'));
   if(tab==='overview')renderOverview();else if(tab==='hosts')renderHosts();
   else if(tab==='findings')renderFindings();else if(tab==='assets')renderAssets();
   else if(tab==='emails')renderEmails();
   else if(tab==='shots')renderShots();
+  else if(tab==='meta')renderMeta();
 }
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>show(b.dataset.tab));
 document.getElementById('search').addEventListener('input',()=>schedule('search',rerender,180));
@@ -2030,6 +2106,10 @@ class Handler(BaseHTTPRequestHandler):
                 "removed": self.removed,
             }
             return self._send(200, json.dumps(payload), ctype="application/json; charset=utf-8")
+
+        if path == "/api/raw":
+            rows = [meta_row(e) for e in self.events]
+            return self._send(200, json.dumps(rows), ctype="application/json; charset=utf-8")
 
         if path == "/api/screenshots":
             out = []
