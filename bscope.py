@@ -148,6 +148,21 @@ def _tag(ev, *names):
     return any(n in t for t in tl for n in names)
 
 
+def _nuclei_name(ev):
+    """Pull the real template name/id out of a BBOT nuclei FINDING so the
+    finding is titled by what it actually is ("Missing Cookie SameSite Strict")
+    instead of a generic "Nuclei template match". BBOT formats the description
+    as 'template: [<id>], name: [<name>] Extracted Data: [...]'."""
+    blob = (ev.get("data_str", "") or "") + " " + (ev.get("desc", "") or "")
+    m = re.search(r"name:\s*\[([^\]]+)\]", blob)
+    if m:
+        return re.sub(r"^Nuclei Vuln - ", "", m.group(1).strip())
+    m = re.search(r"template:\s*\[([^\]]+)\]", blob)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
 RULES = [
     # --- module-keyed rules first: a BBOT module name is the least ambiguous
     #     signal, and these findings often carry no CVE/keyword text to match on.
@@ -456,6 +471,11 @@ def enrich(ev):
     for name, pred, desc, play in RULES:
         try:
             if pred(ev):
+                if name == "Nuclei template match":
+                    # title the finding by its real template name, not generically
+                    nm = _nuclei_name(ev)
+                    if nm:
+                        name = nm
                 return name, desc, list(play)
         except Exception:
             continue
