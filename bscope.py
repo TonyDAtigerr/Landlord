@@ -163,6 +163,14 @@ def _nuclei_name(ev):
     return ""
 
 
+def _nuclei_template_id(ev):
+    """The nuclei template id (e.g. 'missing-cookie-samesite-strict') for a
+    targeted re-run command. Falls back to empty when it can't be parsed."""
+    blob = (ev.get("data_str", "") or "") + " " + (ev.get("desc", "") or "")
+    m = re.search(r"template:\s*\[([^\]]+)\]", blob)
+    return m.group(1).strip() if m else ""
+
+
 RULES = [
     # --- module-keyed rules first: a BBOT module name is the least ambiguous
     #     signal, and these findings often carry no CVE/keyword text to match on.
@@ -530,26 +538,143 @@ def enrich(ev):
              "Decide if it widens the attack surface or confirms an existing lead."])
 
 
+# Per-service commands for an OPEN_TCP_PORT finding ({h}=host, {p}=port).
+PORT_CMDS = {
+    21:   [("FTP anon login", "nmap --script ftp-anon,ftp-syst -p21 {h}")],
+    22:   [("SSH banner/algos", "nmap --script ssh2-enum-algos,ssh-hostkey -p22 {h}")],
+    23:   [("Telnet banner", "nmap --script telnet-encryption,banner -p23 {h}")],
+    25:   [("SMTP relay/users", "nmap --script smtp-open-relay,smtp-commands,smtp-enum-users -p25 {h}")],
+    53:   [("DNS zone transfer", "dig AXFR @{h} <domain>")],
+    110:  [("POP3 caps", "nmap --script pop3-capabilities,banner -p110 {h}")],
+    135:  [("MSRPC endpoints", "rpcdump.py @{h}")],
+    139:  [("NetBIOS enum", "enum4linux-ng {h}")],
+    143:  [("IMAP caps", "nmap --script imap-capabilities,banner -p143 {h}")],
+    161:  [("SNMP walk", "snmpwalk -v2c -c public {h}")],
+    389:  [("LDAP anon bind", "ldapsearch -x -H ldap://{h} -b '' -s base")],
+    445:  [("SMB shares", "smbclient -L //{h} -N"),
+           ("SMB enum", "enum4linux-ng {h}"),
+           ("SMB vulns", "nmap --script 'smb-vuln*' -p445 {h}")],
+    1433: [("MSSQL info", "nmap --script ms-sql-info,ms-sql-ntlm-info -p1433 {h}")],
+    1521: [("Oracle SID", "nmap --script oracle-sid-brute -p1521 {h}")],
+    2049: [("NFS exports", "showmount -e {h}")],
+    3306: [("MySQL info", "nmap --script mysql-info,mysql-empty-password -p3306 {h}")],
+    3389: [("RDP NTLM info", "nmap --script rdp-ntlm-info -p3389 {h}")],
+    5432: [("Postgres probe", "nmap --script pgsql-brute -p5432 {h}")],
+    5900: [("VNC auth check", "nmap --script vnc-info,realvnc-auth-bypass -p5900 {h}")],
+    6379: [("Redis unauth", "redis-cli -h {h} info")],
+    8080: [("Web check", "httpx -u http://{h}:8080 -sc -title -tech-detect")],
+    9200: [("ES indices", "curl -s http://{h}:9200/_cat/indices")],
+    11211:[("Memcached info", "nmap --script memcached-info -p11211 {h}")],
+    27017:[("MongoDB dbs", "nmap --script mongodb-info,mongodb-databases -p27017 {h}")],
+}
+
+
 def suggest_commands(ev):
-    """Build a few copy-paste recon/verification commands for this event."""
+    """Build copy-paste commands tailored to what the finding actually is:
+    a targeted verification for known finding types (nuclei template re-run,
+    .git dump, bucket listing, takeover dig, per-service port probes), then
+    generic recon as context. Falls back to recon when nothing specific fits."""
     cmds = []
     host, url, port, scheme = ev["host"], ev["url"], ev["port"], ev["scheme"]
+    typ = ev.get("type", "")
+    # a concrete web target: a real URL, else a scheme+host we actually saw
+    web = url or (("%s://%s" % (scheme, host)) if (scheme and host) else "")
+    webroot = web.rstrip("/") if web else ""
+    t = ((ev.get("title", "") or "") + " " + (ev.get("text", "") or "")).lower()
+    targeted = False
 
-    if url:
-        cmds.append(("Headers", f"curl -sSIk '{url}'"))
-        cmds.append(("Fingerprint", f"httpx -u '{url}' -sc -title -tech-detect -server"))
-        cmds.append(("Nuclei", f"nuclei -u '{url}'"))
-        cmds.append(("Content discovery",
-                     f"ffuf -u '{url.rstrip('/')}/FUZZ' -w /usr/share/seclists/Discovery/Web-Content/common.txt"))
-    elif host and port:
-        cmds.append(("Service scan", f"nmap -sCV -p{port} {host}"))
-    elif host:
-        cmds.append(("Port scan", f"nmap -sCV --top-ports 1000 {host}"))
-        cmds.append(("Quick web check", f"httpx -u {host} -sc -title -tech-detect"))
+    def add(label, cmd):
+        if cmd and (label, cmd) not in cmds:
+            cmds.append((label, cmd))
+
+    # ---- finding-specific verification (most relevant first) ----
+    if _mod(ev, "nuclei"):
+        tid = _nuclei_template_id(ev)
+        if tid and web:
+            add("Re-run this template", "nuclei -id %s -u '%s' -debug" % (tid, web))
+            targeted = True
+    if _mod(ev, "baddns") or _has(ev, "takeover", "dangling", "unclaimed", "can be taken over"):
+        if host:
+            add("Check dangling DNS", "dig +noall +answer CNAME %s ; dig +noall +answer A %s" % (host, host))
+            targeted = True
+    if _mod(ev, "git") or "/.git" in t or ".git/" in t:
+        if webroot:
+            base = re.sub(r"/\.git(/.*)?$", "", webroot)  # avoid /.git/.git when the URL is already the .git dir
+            add("Confirm .git exposure", "curl -sSIk '%s/.git/HEAD'" % base)
+            add("Dump the repo", "git-dumper '%s/.git/' ./gitdump" % base)
+            targeted = True
+    if _mod(ev, "bucket") or "bucket" in t or "s3://" in t or " s3 " in t:
+        if host:
+            add("List bucket (S3)", "aws s3 ls s3://%s --no-sign-request" % host)
+            targeted = True
+    if _mod(ev, "trufflehog") or "leaked" in t or "secret" in t or "credential" in t or "api key" in t:
+        add("Verify the secret", "# test the leaked credential read-only against its own service; do not reuse elsewhere")
+        targeted = True
+    if _mod(ev, "host_header") or "host header" in t:
+        if web:
+            add("Host-header injection", "curl -sSIk -H 'Host: evil.example' '%s'" % web)
+            targeted = True
+    if _mod(ev, "ntlm") or "ntlm" in t:
+        if web:
+            add("NTLM info leak", "curl -sSIk -H 'Authorization: NTLM TlRMTVNTUAABAAAAB4IIAA==' '%s'" % web)
+            targeted = True
+    if _mod(ev, "graphql") or "graphql" in t or "introspection" in t:
+        if web:
+            add("GraphQL introspection",
+                "curl -sSk '%s' -H 'Content-Type: application/json' "
+                "-d '{\"query\":\"{__schema{types{name}}}\"}'" % web)
+            targeted = True
+    if "cors" in t:
+        if web:
+            add("CORS misconfig", "curl -sSIk -H 'Origin: https://evil.example' '%s'" % web)
+            targeted = True
+    if _has(ev, "sql injection", "sqli"):
+        if web:
+            add("Confirm SQLi", "sqlmap -u '%s' --batch --level 2 --risk 2" % web)
+            targeted = True
+    if _has(ev, "cross-site scripting", "xss"):
+        if web:
+            add("Probe XSS context", "curl -sSk '%s'   # inject a benign marker and inspect the reflection context" % web)
+            targeted = True
+    if _mod(ev, "telerik", "ajaxpro", "dotnetnuke") or "telerik" in t or "dotnetnuke" in t or "ajaxpro" in t:
+        if web:
+            add("Targeted template scan", "nuclei -tags telerik,dotnetnuke,aspx -u '%s'" % web)
+            targeted = True
+    if _mod(ev, "retirejs") or ("vulnerable" in t and ("javascript" in t or ".js" in t)):
+        if web:
+            add("Re-check JS libraries", "nuclei -tags tech,javascript -u '%s'" % web)
+            targeted = True
+
+    # ---- service-specific commands for an open port ----
+    if typ == "OPEN_TCP_PORT" and host:
+        for label, tmpl in PORT_CMDS.get(port, []):
+            add(label, tmpl.format(h=host, p=port))
+        if port not in PORT_CMDS:
+            add("Service scan", "nmap -sCV -p%s %s" % (port, host))
+        targeted = True
+
+    # ---- asset recon when there is no specific finding to verify ----
+    if typ in ("DNS_NAME", "DNS_NAME_UNRESOLVED") and host:
+        add("Resolve", "dig +short %s A ; dig +short %s CNAME" % (host, host))
+        add("Port scan", "nmap -sCV --top-ports 1000 %s" % host)
+        add("Quick web check", "httpx -u %s -sc -title -tech-detect" % host)
+
+    # ---- generic web context (after the tailored commands) ----
+    if web:
+        add("Response headers", "curl -sSIk '%s'" % web)
+        add("Fingerprint", "httpx -u '%s' -sc -title -tech-detect -server" % web)
+        if not targeted:
+            add("Nuclei scan", "nuclei -u '%s'" % web)
+            add("Content discovery",
+                "ffuf -u '%s/FUZZ' -w /usr/share/seclists/Discovery/Web-Content/common.txt" % webroot)
+    elif host and not port and typ not in ("DNS_NAME", "DNS_NAME_UNRESOLVED"):
+        add("Port scan", "nmap -sCV --top-ports 1000 %s" % host)
+        add("Quick web check", "httpx -u %s -sc -title -tech-detect" % host)
 
     if host:
-        cmds.append(("Screenshot", f"gowitness single https://{host}"))
-    return cmds
+        add("Screenshot", "gowitness single https://%s" % host)
+
+    return cmds[:7]
 
 
 # --------------------------------------------------------------------------- #
