@@ -1403,6 +1403,12 @@ td.mono{font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all;}
 .shot img{width:100%;height:100%;object-fit:cover;object-position:top;display:block;}
 .shot .m{padding:9px 11px;}
 .shot .lbl{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.shoturl{display:block;padding:8px 11px;font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;border-bottom:1px solid var(--line);background:var(--panel2);}
+a.shoturl{color:var(--accent2);text-decoration:none;}
+a.shoturl:hover{text-decoration:underline;background:var(--panel);}
+.shoturl.nolink{color:var(--muted);font-weight:500;}
+.shoturl .ext{opacity:.7;font-weight:400;}
 .lb{position:fixed;inset:0;background:rgba(0,0,0,.93);z-index:100;display:none;flex-direction:column;}
 .lb.open{display:flex;}
 .lb-bar{padding:11px 16px;display:flex;gap:12px;align-items:center;border-bottom:1px solid var(--line);background:var(--panel);}
@@ -1875,9 +1881,14 @@ function renderShots(){
   h+='<div class="grid">';
   shotView.forEach((it,i)=>{const st=SHOTSMAP[it.status||'new']||SHOTST[0];
     const acc=(it.status&&it.status!=='new')?st.color:'var(--line)';
+    const u=/^https?:\/\//i.test(it.label||'')?it.label:'';
+    const head=u
+      ? `<a class="shoturl" href="${esc(u)}" target="_blank" rel="noopener noreferrer" title="Open ${esc(u)} in a new tab" onclick="event.stopPropagation()">${esc(it.label)} <span class="ext">&#8599;</span></a>`
+      : `<div class="shoturl nolink" title="${esc(it.label)}">${esc(it.label)}</div>`;
     h+=`<div class="shot" style="border-color:${acc}">
+      ${head}
       <div class="thumb" onclick="openLb(${i})"><img loading="lazy" src="${it.src}"></div>
-      <div class="m"><div class="lbl" title="${esc(it.label)}">${esc(it.label)}</div>
+      <div class="m">
       <div class="sub">${esc(it.file)}${it.size?(' &middot; '+fmt(it.size)):''}</div>
       ${techChips(shotTechs(it))}
       <div class="shotbtns">${shotButtons(it)}</div></div></div>`;});
@@ -2000,7 +2011,7 @@ function renderMeta(){
   let h='<div class="bar"><span class="muted">'+META.length+' events'+(s?(' &middot; '+list.length+' shown'):'')+'</span>';
   h+='<a class="chip" href="/api/export?fmt=json" target="_blank" style="text-decoration:none">&#11015; full JSON</a></div>';
   h+='<div class="bar">';Object.entries(byType).sort((a,b)=>b[1]-a[1]).forEach(([t,c])=>
-    h+=`<span class="chip" onclick="setSearch(${JSON.stringify(t)})">${esc(t)} <span class="muted">${c}</span></span>`);
+    h+=`<span class="chip" onclick="setSearch('${t}')">${esc(t)} <span class="muted">${c}</span></span>`);
   h+='</div>';
   h+='<p class="muted" style="margin:-4px 0 10px">Every field BBOT captured for each event, after dedupe. Click a row to expand the full raw record.</p>';
   if(!list.length){h+='<div class="empty">No events matched.</div>';el.innerHTML=h;return;}
@@ -2036,7 +2047,7 @@ function renderEmails(){
   h+='<p class="muted" style="margin:-4px 0 10px">Deduplicated addresses. Export the .txt and feed it into user-enumeration tools (onedrive_user_enum, o365enum, &hellip;).</p>';
   const byDom={};all.forEach(e=>{const d=(e.split('@')[1]||'?');byDom[d]=(byDom[d]||0)+1;});
   h+='<div class="bar">';Object.entries(byDom).sort((a,b)=>b[1]-a[1]).forEach(([d,c])=>
-    h+=`<span class="chip" onclick="setSearch('@'+${JSON.stringify(d)})">${esc(d)} <span class="muted">${c}</span></span>`);
+    h+=`<span class="chip" onclick="setSearch('@${d}')">${esc(d)} <span class="muted">${c}</span></span>`);
   h+='</div>';
   if(!list.length){h+='<div class="empty">No emails matched.</div>';document.getElementById('view-emails').innerHTML=h;return;}
   h+='<table><thead><tr><th>#</th><th>Email</th><th>Domain</th></tr></thead><tbody>';
