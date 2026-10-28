@@ -2029,6 +2029,32 @@ function renderMeta(){
 
 /* ---------------- EMAILS ---------------- */
 function copyEmails(){copy((DATA.emails||[]).join('\n'));toast((DATA.emails||[]).length+' emails copied');}
+function emailEnumCmds(d){
+  // d is a domain; emails.txt is the exported address list (full user@dom lines).
+  return [
+    ['o365spray \u2014 user enum (oauth2)',
+       `o365spray --enum -U emails.txt --domain ${d} --enum-module oauth2`],
+    ['o365spray \u2014 user enum (onedrive, unauthenticated)',
+       `o365spray --enum -U emails.txt --domain ${d} --enum-module onedrive`],
+    ['onedrive_user_enum',
+       `python3 onedrive_enum.py -d ${d} -U emails.txt`],
+  ];
+}
+function emailCmdBlock(doms){
+  let h='';
+  const many=doms.length>6;
+  const shown=many?['<domain>']:doms;
+  h+='<p class="muted" style="margin:14px 0 4px">Ready-to-run user enumeration'
+    +(many?(' (template \u2014 '+doms.length+' domains found; swap in each)'):'')+':</p>';
+  shown.forEach(d=>{
+    if(shown.length>1)h+=`<div class="muted" style="margin:8px 0 2px">&#9656; ${esc(d)}</div>`;
+    emailEnumCmds(d).forEach(c=>{
+      h+=`<div class="cmd"><code title="${esc(c[0])}">${esc(c[1])}</code>`
+        +`<button class="copy" onclick="${hx('copy('+JSON.stringify(c[1])+')')}">copy</button></div>`;
+    });
+  });
+  return h;
+}
 function renderEmails(){
   const all=DATA.emails||[];const s=q();
   const list=s?all.filter(e=>e.toLowerCase().includes(s)):all;
@@ -2044,11 +2070,12 @@ function renderEmails(){
       +'<span class="kbd">skymem</span>, <span class="kbd">hunterio</span>, '
       +'<span class="kbd">dehashed</span>&hellip;) to populate this.</div>';
     document.getElementById('view-emails').innerHTML=h;return;}
-  h+='<p class="muted" style="margin:-4px 0 10px">Deduplicated addresses. Export the .txt and feed it into user-enumeration tools (onedrive_user_enum, o365enum, &hellip;).</p>';
+  h+='<p class="muted" style="margin:-4px 0 10px">Deduplicated addresses. Export the .txt and feed it into user-enumeration tools &mdash; o365spray (with <span class="kbd">--enum-module</span>), onedrive_user_enum, &hellip;</p>';
   const byDom={};all.forEach(e=>{const d=(e.split('@')[1]||'?');byDom[d]=(byDom[d]||0)+1;});
   h+='<div class="bar">';Object.entries(byDom).sort((a,b)=>b[1]-a[1]).forEach(([d,c])=>
     h+=`<span class="chip" onclick="setSearch('@${d}')">${esc(d)} <span class="muted">${c}</span></span>`);
   h+='</div>';
+  h+=emailCmdBlock(Object.keys(byDom).filter(d=>d&&d!=='?').sort());
   if(!list.length){h+='<div class="empty">No emails matched.</div>';document.getElementById('view-emails').innerHTML=h;return;}
   h+='<table><thead><tr><th>#</th><th>Email</th><th>Domain</th></tr></thead><tbody>';
   list.forEach((e,i)=>{const dom=e.split('@')[1]||'';
