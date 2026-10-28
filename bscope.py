@@ -897,16 +897,21 @@ def dedupe_events(events):
     """Drop exact-duplicate events so the same finding/asset appears once. Two
     events are duplicates only when type, target (host/url/port) and data all
     match, so the same issue reported twice on one target collapses while the
-    same issue on different hosts stays separate. First occurrence wins, which
-    preserves order and the triage keyed on that first event."""
-    seen = set()
+    same issue on different hosts stays separate. The most-severe copy of a
+    duplicate is the one kept (so a low-severity twin can never swallow a
+    critical), at the position of the first occurrence. Exact duplicates share
+    the same event id (type|data_str), so triage carries over regardless."""
+    seen = {}            # dedupe key -> index into out
     out = []
     for ev in events:
         key = (ev.get("type", ""), ev.get("host", ""), ev.get("url", ""),
                ev.get("port", 0), ev.get("data_str", ""))
         if key in seen:
+            i = seen[key]
+            if SEV_RANK.get(ev.get("priority"), 0) > SEV_RANK.get(out[i].get("priority"), 0):
+                out[i] = ev            # keep the most severe of exact duplicates
             continue
-        seen.add(key)
+        seen[key] = len(out)
         out.append(ev)
     return out
 
