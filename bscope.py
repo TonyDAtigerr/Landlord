@@ -748,18 +748,40 @@ def attach_display_hosts(events):
     return events
 
 
-def load_events(path):
+def dedupe_events(events):
+    """Drop exact-duplicate events so the same finding/asset appears once. Two
+    events are duplicates only when type, target (host/url/port) and data all
+    match, so the same issue reported twice on one target collapses while the
+    same issue on different hosts stays separate. First occurrence wins, which
+    preserves order and the triage keyed on that first event."""
+    seen = set()
+    out = []
+    for ev in events:
+        key = (ev.get("type", ""), ev.get("host", ""), ev.get("url", ""),
+               ev.get("port", 0), ev.get("data_str", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ev)
+    return out
+
+
+def _read_events(path):
     ext = os.path.splitext(path)[1].lower()
     if ext in (".ndjson", ".jsonl", ".json"):
-        return attach_display_hosts(parse_ndjson(path))   # handles array or ndjson
+        return parse_ndjson(path)               # handles array or ndjson
     if ext in (".csv", ".tsv"):
-        return attach_display_hosts(parse_csv(path))
+        return parse_csv(path)
     # try to sniff
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         head = f.read(2048).lstrip()
     if head.startswith("{") or head.startswith("["):
-        return attach_display_hosts(parse_ndjson(path))
-    return attach_display_hosts(parse_csv(path))
+        return parse_ndjson(path)
+    return parse_csv(path)
+
+
+def load_events(path):
+    return dedupe_events(attach_display_hosts(_read_events(path)))
 
 
 # --------------------------------------------------------------------------- #
