@@ -205,7 +205,8 @@ Each run writes to an output folder (`recon_<date>` by default):
 - `out_of_scope_ips.txt` — the bare out-of-scope IPs
 
 **For your scanners**
-- `inscope_ips.txt` — every in-scope IP (with and without a hostname) → feed to Nessus / nmap
+- `active_targets.txt` — one entry per in-scope host, deduplicated: the hostname if it has one, otherwise the bare IP (no overlap — an IP a hostname already resolves to is not repeated). This is the list the active scan uses, and the list to paste into Nessus / nmap.
+- `inscope_ips.txt` — every in-scope IP (with and without a hostname)
 - `inscope_hostnames.txt` — confirmed in-scope hostnames
 - `inscope_ips_no_hostname.txt` — in-scope IPs no hostname points at (subset of the above)
 - `open_ports.txt` — open ports BBOT confirmed, as `host:port`

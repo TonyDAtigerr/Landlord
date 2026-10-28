@@ -380,6 +380,8 @@ fi
 
 # The active scan targets everything in scope: the confirmed hostnames PLUS the
 # bare in-scope IPs no hostname pointed at (so nothing on those IPs is missed).
+# This same list - one entry per host, hostname when there is one else the bare
+# IP, no overlap - is exactly what to feed Nessus/nmap.
 ACTIVE_TARGETS="$OUT/active_targets.txt"
 cat "$INSCOPE_HOSTS" "$NOHOST_IPS" | awk 'NF && !seen[$0]++' > "$ACTIVE_TARGETS"
 ACTIVE_COUNT=$(wc -l < "$ACTIVE_TARGETS" | tr -d ' ')
@@ -476,6 +478,7 @@ err "     Scope report (Excel)      : $LAND_XLSX"
 err "     Out-of-scope / cloud hosts: $OOS_XLSX"
 err "     Out-of-scope IPs only     : $OOS_IPS"
 err "   FOR YOUR SCANNERS (Nessus, nmap...):"
+err "     Targets, 1 per host (Nessus): $ACTIVE_TARGETS"
 err "     In-scope IPs (ALL)        : $INSCOPE_IPS"
 err "     In-scope hostnames        : $INSCOPE_HOSTS"
 err "     In-scope IPs, no hostname : $NOHOST_IPS"

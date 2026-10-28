@@ -29,6 +29,7 @@ import argparse
 import csv
 import hashlib
 import html
+import ipaddress
 import json
 import os
 import posixpath
@@ -135,10 +136,163 @@ def _has(ev, *words):
     return any(w in t for w in words)
 
 
+def _mod(ev, *names):
+    """Match on the BBOT source module (exact-ish, substring-tolerant)."""
+    m = (ev.get("module") or "").lower()
+    return any(n in m for n in names)
+
+
+def _tag(ev, *names):
+    """Match on any of the event's tags."""
+    tl = [str(t).lower() for t in ev.get("tags", [])]
+    return any(n in t for t in tl for n in names)
+
+
 RULES = [
-    # --- specific vulnerability classes first (most actionable, least ambiguous) ---
+    # --- module-keyed rules first: a BBOT module name is the least ambiguous
+    #     signal, and these findings often carry no CVE/keyword text to match on.
+    ("Vulnerable JavaScript library (retirejs)",
+     lambda ev: _mod(ev, "retirejs") or _has(ev, "vulnerable javascript library"),
+     "A JavaScript library loaded by this page is a version with publicly known "
+     "vulnerabilities (flagged by Retire.js). BBOT hardcodes every retirejs finding "
+     "to severity INFO regardless of real risk, so read the 'Severity:' and 'CVE(s):' "
+     "text in the finding - a HIGH/CRITICAL retire.js entry is not informational.",
+     ["Read the finding text for the library, version, advisory summary and CVE IDs; "
+      "the true severity is the 'Severity:' value, not the INFO band shown here.",
+      "Confirm the library is actually used (not dead/bundled code): load the page, "
+      "check DevTools > Network/Sources for the script and whether the vulnerable sink is reached.",
+      "Map each CVE/advisory to a PoC (Snyk, GitHub advisory, Exploit-DB, nuclei -tags cve); "
+      "many retire.js hits are DOM-XSS or prototype pollution reachable from the page.",
+      "Impact is reachability-driven: a vulnerable jQuery/Angular fed attacker-influenced "
+      "input can be client-side XSS/RCE. Note the loading page (parent URL), not just the script URL."]),
+
+    ("Known framework secret / signing key (badsecrets)",
+     lambda ev: _mod(ev, "badsecrets") or _has(ev, "machine key", "machinekey", "viewstate",
+                     "secret_key_base", "django secret", "known secret", "cryptographic"),
+     "A hardcoded or publicly-known framework secret / signing key was detected "
+     "(e.g. ASP.NET MachineKey / ViewState, Django SECRET_KEY, Flask session key, "
+     "Rails secret_key_base, Express cookie secret, or a known Telerik/JWT key). These "
+     "keys let an attacker forge data the server trusts - frequently a critical, not info, finding.",
+     ["Identify which framework and key type the finding names - the exploit path differs per framework.",
+      "ASP.NET ViewState / MachineKey: forge a malicious __VIEWSTATE with ysoserial.net for RCE.",
+      "Django / Flask / Rails / Express: forge or decrypt session cookies for auth bypass / admin "
+      "escalation (Flask: flask-unsign; Rails: the secret_key_base + Marshal/JWT).",
+      "Report for immediate key rotation - a leaked signing key is exploitable until rotated."]),
+
+    ("Telerik UI (deserialization / weak-key RCE)",
+     lambda ev: _mod(ev, "telerik") or _has(ev, "telerik"),
+     "A Telerik UI for ASP.NET component was detected; these are commonly vulnerable to "
+     "insecure deserialization and cryptographic weaknesses that lead to RCE.",
+     ["Probe the RadAsyncUpload / Telerik.Web.UI.DialogHandler.aspx endpoints and read the version.",
+      "CVE-2017-11317 / CVE-2017-11357: known/weak encryption keys allow arbitrary file upload.",
+      "CVE-2019-18935: insecure deserialization in RadAsyncUpload -> RCE; recover the key "
+      "(often via badsecrets) then use the public PoC to upload a mixed-mode DLL.",
+      "Confirmed cases are critical - capture a benign PoC (e.g. DNS callback) before command execution."]),
+
+    ("AjaxPro deserialization (RCE)",
+     lambda ev: _mod(ev, "ajaxpro") or _has(ev, "ajaxpro"),
+     "AjaxPro endpoints were detected; this .NET library is vulnerable to insecure "
+     "deserialization (CVE-2021-23758 and related) leading to remote code execution.",
+     ["Confirm the AjaxPro handler path (e.g. /ajaxpro/) and the version in use.",
+      "CVE-2021-23758: send a JSON payload with a dangerous .NET type to the AjaxPro "
+      "converter endpoint to achieve RCE - authorised targets only.",
+      "Prove it safely first (trigger an interactsh/DNS callback) before any command execution."]),
+
+    ("DotNetNuke / DNN CMS",
+     lambda ev: _mod(ev, "dotnetnuke") or _has(ev, "dotnetnuke", "dnn "),
+     "A DotNetNuke (DNN) CMS instance was detected; older versions carry high-impact CVEs.",
+     ["Fingerprint the exact version (/js/dnn.js, Default.aspx headers, /Install/InstallWizard.aspx).",
+      "CVE-2017-9822 (DNNPersonalization cookie deserialization) -> RCE on 9.1.0 and earlier.",
+      "Check for an exposed install/upgrade wizard (re-install takeover) and default host/admin creds."]),
+
+    ("GraphQL introspection enabled",
+     lambda ev: _mod(ev, "graphql_introspection") or _has(ev, "introspection", "graphql"),
+     "A GraphQL endpoint has introspection enabled, exposing the full schema (types, "
+     "queries, mutations) - a complete map of the API's attack surface.",
+     ["Dump and browse the schema (GraphQL Voyager / InQL / graphql-cop) for sensitive "
+      "queries and mutations (user lookup, password reset, admin ops).",
+      "Test authorization on each sensitive field (IDOR / broken access control).",
+      "Check alias/batching brute force and query-depth DoS, and field-level auth."]),
+
+    ("Host header injection",
+     lambda ev: _mod(ev, "host_header") or _has(ev, "host header", "x-forwarded-host"),
+     "The application reflects or trusts an attacker-controlled Host (or X-Forwarded-Host) "
+     "header, enabling password-reset poisoning, web-cache poisoning and routing-based SSRF.",
+     ["Reproduce: resend with Host: evil.example (and X-Forwarded-Host) and see where it is "
+      "reflected - links, redirects, absolute URLs.",
+      "Password-reset poisoning: trigger a reset and check the email link uses your injected host.",
+      "Cache poisoning: if a cacheable response reflects the header, confirm the cache key, then "
+      "poison it for other users."]),
+
+    ("NTLM endpoint - internal name disclosure",
+     lambda ev: _mod(ev, "ntlm") or _has(ev, "ntlm"),
+     "An endpoint accepts NTLM authentication and leaks internal names in its NTLM type-2 "
+     "challenge - typically the NetBIOS/DNS domain and host name.",
+     ["Decode the challenge for the internal domain and hostname: "
+      "nmap --script http-ntlm-info -p<port> <host> (or a curl Type-1 Authorization header).",
+      "Feed the internal domain/host into AD recon and your target naming model.",
+      "Externally-exposed NTLM-over-HTTP (OWA/Autodiscover/RPC) is a password-spray surface - "
+      "authorised, low-and-slow only."]),
+
+    ("Interesting / reflected parameter",
+     lambda ev: _mod(ev, "hunt", "reflected_parameters", "paramminer")
+                or _has(ev, "reflected parameter", "interesting parameter", "hidden parameter"),
+     "Parameters were flagged as interesting (names historically tied to a vuln class) or "
+     "shown to reflect their value into the response - leads for manual testing, not confirmed bugs.",
+     ["Match each parameter to its likely class: url/redirect -> open redirect/SSRF; "
+      "file/path/template -> LFI/traversal/SSTI; id/user -> IDOR; q/search -> XSS/SQLi.",
+      "For reflected params, test the reflection context (HTML / attribute / JS) for XSS and open redirect.",
+      "Fuzz each parameter manually with class-appropriate payloads and capture a clean PoC."]),
+
+    ("403 / WAF bypass",
+     lambda ev: _mod(ev, "bypass403", "waf_bypass")
+                or _has(ev, "403 bypass", "forbidden bypass", "waf bypass"),
+     "A path that returned 403/401 (or was WAF-blocked) became reachable via a bypass "
+     "technique (path / verb / header tampering), so an access-control or WAF rule can be evaded.",
+     ["Reproduce the exact bypass shown (trailing / . // %2e, X-Original-URL / X-Rewrite-URL, "
+      "verb change) and confirm you receive the protected content.",
+      "Enumerate what the now-reachable endpoint exposes (admin, API, files) and chain from there.",
+      "Report the specific bypass primitive and the restricted resource it unlocks."]),
+
+    ("Exposed ASP.NET /bin assemblies",
+     lambda ev: _mod(ev, "aspnet_bin") or _has(ev, "bin exposure", "aspnet_bin"),
+     "The ASP.NET application's /bin directory (compiled .NET assemblies) is web-reachable, "
+     "exposing the app's DLLs for download and reverse-engineering.",
+     ["Download the exposed assemblies and decompile them (dnSpy / ILSpy) for source, "
+      "connection strings, API keys and hardcoded secrets.",
+      "Review the logic for auth bypasses, deserialization sinks and crypto keys you can reuse "
+      "(pair with badsecrets).",
+      "Flag the directory exposure itself as an information-disclosure finding."]),
+
+    ("Self-hosted GitLab instance",
+     lambda ev: _mod(ev, "gitlab") or _has(ev, "gitlab"),
+     "A self-hosted GitLab instance was identified - a high-value target that often leaks "
+     "source, CI/CD secrets and credentials.",
+     ["Read the version (/help, /api/v4/version, HTTP headers) and map it to GitLab CVEs "
+      "(e.g. CVE-2021-22205 unauthenticated RCE, plus account-takeover / path-traversal CVEs).",
+      "Check whether open registration is enabled; enumerate public/internal projects and "
+      "snippets for secrets.",
+      "Look for exposed CI/CD variables and runner registration; never brute credentials unauthorised."]),
+
+    ("Nuclei template match",
+     lambda ev: _mod(ev, "nuclei"),
+     "A Nuclei template matched on this asset. Severity and meaning come entirely from the "
+     "template. Most info/low hits are fingerprinting - tech, CDN, WAF, TLS and DNS detection "
+     "(e.g. 'microsoft/cdn/cloud' tags) - which is context, not a vulnerability. The real "
+     "findings are the medium+ ones: CVEs, exposures and misconfigurations.",
+     ["Triage by severity first: info/low nuclei matches are usually detection noise - "
+      "uncheck 'info' (and 'low') in the severity bar and work the medium+ list. Mark the "
+      "detection ones 'not exploitable' or 'reviewed' in bulk.",
+      "For anything medium+, open the template id to see what it checked and its matcher "
+      "(github.com/projectdiscovery/nuclei-templates).",
+      "Re-run just that template to confirm and capture the request/response: "
+      "nuclei -id <template-id> -u <url> -debug.",
+      "If it maps to a CVE, pull a PoC and assess real impact and reachability before "
+      "reporting; rule out a false match from the matcher."]),
+
+    # --- specific vulnerability classes (most actionable, least ambiguous) ---
     ("Subdomain takeover",
-     lambda ev: _has(ev, "takeover", "dangling", "can be taken over", "unclaimed"),
+     lambda ev: _mod(ev, "baddns") or _has(ev, "takeover", "dangling", "can be taken over", "unclaimed"),
      "A DNS record points at a de-provisioned third-party service, so an attacker "
      "can register that service and serve attacker-controlled content from your domain.",
      ["Confirm the dangling record: dig CNAME <host> / dig A <host>.",
@@ -174,7 +328,7 @@ RULES = [
       "Chain it: OAuth/SAML token theft, phishing from a trusted domain, or SSRF filter bypass."]),
 
     ("SSRF",
-     lambda ev: _has(ev, "ssrf", "server-side request forgery"),
+     lambda ev: _mod(ev, "generic_ssrf") or _has(ev, "ssrf", "server-side request forgery"),
      "The application can be coerced into making server-side requests to a "
      "target of the attacker's choosing.",
      ["Point it at a collaborator host (interactsh) to confirm egress.",
@@ -190,8 +344,9 @@ RULES = [
 
     # --- exposed data / files ---
     ("Open cloud storage bucket",
-     lambda ev: ev["type"] == "STORAGE_BUCKET" or _has(ev, "open bucket", "public bucket",
-                                                        "publicly listable", "world-readable"),
+     lambda ev: ev["type"] == "STORAGE_BUCKET" or _mod(ev, "bucket_")
+                or _has(ev, "open bucket", "public bucket",
+                        "publicly listable", "world-readable"),
      "A cloud storage bucket (S3/GCS/Azure) is publicly listable or readable, "
      "potentially exposing files and enabling tampering if writable.",
      ["List it: aws s3 ls --no-sign-request s3://<bucket> (or gsutil ls / az).",
@@ -201,7 +356,8 @@ RULES = [
       "Grep retrieved files for credentials and internal hostnames."]),
 
     ("Exposed .git directory",
-     lambda ev: _has(ev, "/.git", "git exposure", ".git/head", "git directory"),
+     lambda ev: (_mod(ev, "git") and not _mod(ev, "gitlab"))
+                or _has(ev, "/.git", "git exposure", ".git/head", "git directory"),
      "A web-accessible .git directory lets anyone reconstruct source code and "
      "read the full commit history.",
      ["Dump it: git-dumper http://<host>/.git/ ./loot (or GitTools).",
@@ -210,6 +366,7 @@ RULES = [
 
     ("Leaked secret / credential",
      lambda ev: ev["type"] in ("SECRET", "PASSWORD", "HASHED_PASSWORD")
+                or _mod(ev, "trufflehog", "gitleaks")
                 or _has(ev, "trufflehog", "gitleaks", "api key", "secret key",
                         "access key", "bearer token", "private key"),
      "A credential or high-entropy secret was found (code repo, JS bundle, "
@@ -328,7 +485,25 @@ def enrich(ev):
                 ["Screenshot + fingerprint (httpx/whatweb).",
                  "Run content discovery (ffuf/feroxbuster) and nuclei against it."])
 
-    # generic fallback
+    # generic fallback for findings that matched no playbook: stay finding-oriented
+    # and name the producing module so the tester knows where to look it up.
+    if ev["lane"] == "finding":
+        mod = ev.get("module") or ""
+        title = "%s%s" % (ev["type"].replace("_", " ").title(),
+                          (" (%s)" % mod) if mod else "")
+        desc = ("A finding was reported%s that matches no built-in playbook. Read the "
+                "finding text below for the exact issue it reports." %
+                (" by BBOT's '%s' module" % mod if mod else ""))
+        steps = ["Read the raw finding text/description for the exact issue, parameter, "
+                 "URL or header it reports.",
+                 "Reproduce it manually against the target and capture a clean "
+                 "request/response PoC.",
+                 "Judge real impact and reachability before reporting; rule out a false positive."]
+        steps.append("Look up what BBOT's '%s' module checks for to interpret this result."
+                     % mod if mod else "Correlate with other findings on the same host.")
+        return (title, desc, steps)
+
+    # generic fallback (assets)
     return (ev["type"].replace("_", " ").title(),
             "Discovered during the scan; review in context of the surrounding assets.",
             ["Correlate with other findings on the same host.",
@@ -364,9 +539,15 @@ def suggest_commands(ev):
 def _sev_from(blob, tags):
     low = (blob or "").lower()
     for t in (tags or []):
-        tl = str(t).lower()
+        tl = str(t).lower().strip()
         if tl in SEV_RANK:
             return tl
+        # BBOT / nuclei tag forms carry the real severity: "severity-info",
+        # "severity_medium", "severity:high". Without this, info/low nuclei
+        # findings fall through to the FINDING default (medium) and flood the view.
+        m = re.match(r"severity[-_: ]?\s*(critical|high|medium|low|info)$", tl)
+        if m:
+            return m.group(1)
     for sev in ("critical", "high", "medium", "low", "info"):
         if re.search(r"\[%s\]" % sev, low) or ("severity: " + sev) in low:
             return sev
@@ -415,7 +596,7 @@ def _target_bits(type_, data_str, host_hint, url_hint):
     return host, url, port, scheme
 
 
-def _normalize(type_, data, module, tags, ip=""):
+def _normalize(type_, data, module, tags, ip="", resolved=None):
     """Turn a raw event into the normalized dict the UI/knowledge-base use."""
     desc = ""
     host = ip or ""
@@ -439,11 +620,15 @@ def _normalize(type_, data, module, tags, ip=""):
 
     text_blob = " ".join([type_, data_str, desc, module or "", " ".join(map(str, tags))])
 
+    # resolved IPs for this event (used to map an IP-only host back to a hostname)
+    res = [str(r).strip() for r in (resolved if resolved is not None
+                                    else ([ip] if ip else [])) if str(r).strip()]
+
     ev = {
         "type": type_, "module": module or "", "tags": tags,
         "data_str": data_str, "desc": desc,
         "host": host, "url": url, "port": port, "scheme": scheme,
-        "severity": severity, "text": text_blob,
+        "severity": severity, "text": text_blob, "resolved": res,
     }
 
     # final priority band
@@ -509,10 +694,11 @@ def parse_ndjson(path):
     for r in records:
         if not isinstance(r, dict):
             continue
+        rh = r.get("resolved_hosts") if isinstance(r.get("resolved_hosts"), list) else []
         events.append(_normalize(
             r.get("type", "UNKNOWN"), r.get("data", ""),
             r.get("module", ""), r.get("tags", []),
-            ip=(r.get("resolved_hosts") or [""])[0] if isinstance(r.get("resolved_hosts"), list) else "",
+            ip=(rh[0] if rh else ""), resolved=rh,
         ))
     return events
 
@@ -532,20 +718,48 @@ def parse_csv(path):
     return events
 
 
+def is_ip(s):
+    """True if s is an IPv4 or IPv6 literal (i.e. not a hostname)."""
+    try:
+        ipaddress.ip_address(str(s).strip())
+        return True
+    except ValueError:
+        return False
+
+
+def attach_display_hosts(events):
+    """Give every event a 'dhost' (display host): the hostname when we have one,
+    otherwise the IP. BBOT events discovered against a bare IP carry no hostname,
+    so we learn IP->hostname from the events that do (DNS names, URLs, findings
+    with a host field) and back-fill the IP-only ones. The shortest hostname for
+    an IP wins, which prefers the apex/canonical name over long CDN labels."""
+    ip2name = {}
+    for ev in events:
+        h = ev.get("host") or ""
+        if h and not is_ip(h):
+            for rip in ev.get("resolved", []):
+                if is_ip(rip):
+                    cur = ip2name.get(rip)
+                    if cur is None or len(h) < len(cur):
+                        ip2name[rip] = h
+    for ev in events:
+        h = ev.get("host") or ""
+        ev["dhost"] = ip2name[h] if (h and is_ip(h) and h in ip2name) else h
+    return events
+
+
 def load_events(path):
     ext = os.path.splitext(path)[1].lower()
-    if ext in (".ndjson", ".jsonl"):
-        return parse_ndjson(path)
-    if ext == ".json":
-        return parse_ndjson(path)       # handles array or ndjson-in-.json
+    if ext in (".ndjson", ".jsonl", ".json"):
+        return attach_display_hosts(parse_ndjson(path))   # handles array or ndjson
     if ext in (".csv", ".tsv"):
-        return parse_csv(path)
+        return attach_display_hosts(parse_csv(path))
     # try to sniff
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         head = f.read(2048).lstrip()
     if head.startswith("{") or head.startswith("["):
-        return parse_ndjson(path)
-    return parse_csv(path)
+        return attach_display_hosts(parse_ndjson(path))
+    return attach_display_hosts(parse_csv(path))
 
 
 # --------------------------------------------------------------------------- #
@@ -769,7 +983,8 @@ def build_markdown(events, store):
     for sev in order:
         out.append("## %s" % sev.upper())
         for ev, st in by_sev[sev]:
-            target = ev["url"] or (f"{ev['host']}:{ev['port']}" if ev["port"] else ev["host"]) or ev["data_str"][:80]
+            _h = ev.get("dhost") or ev["host"]
+            target = ev["url"] or (f"{_h}:{ev['port']}" if ev["port"] else _h) or ev["data_str"][:80]
             out.append("")
             out.append("### [%s] %s" % (st["status"].replace("_", " "), ev["title"]))
             out.append("- **Target:** %s" % target)
@@ -787,7 +1002,8 @@ def build_markdown(events, store):
 
 
 def _target_of(ev):
-    return ev["url"] or (f"{ev['host']}:{ev['port']}" if ev["port"] else ev["host"]) or ev["data_str"][:120]
+    h = ev.get("dhost") or ev["host"]
+    return ev["url"] or (f"{h}:{ev['port']}" if ev["port"] else h) or ev["data_str"][:120]
 
 
 def build_json_export(events, store):
@@ -880,8 +1096,11 @@ font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;overflow-x:auto
 padding:3px 8px;font-size:11px;cursor:pointer;}
 .statusrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;align-items:center;}
 .sbtn{border:1px solid var(--line);background:var(--panel2);color:var(--muted);border-radius:6px;
-padding:4px 9px;font-size:12px;cursor:pointer;}
-.sbtn.on{color:#07101f;font-weight:600;border-color:transparent;}
+padding:4px 9px;font-size:12px;cursor:pointer;transition:box-shadow .1s,background .1s,color .1s;}
+.sbtn:hover{border-color:var(--accent);color:var(--text);}
+.sbtn.on{color:#07101f;font-weight:700;border-color:transparent;
+box-shadow:0 0 0 2px var(--panel),0 0 0 4px rgba(255,255,255,.92);}
+.sbtn.on::before{content:"\2713\00a0";}
 .notes{width:100%;margin-top:8px;background:#0a0e15;border:1px solid var(--line);border-radius:6px;
 color:var(--text);padding:7px 9px;font-size:13px;resize:vertical;min-height:34px;outline:none;}
 .notes:focus{border-color:var(--accent2);}
@@ -939,6 +1158,10 @@ padding:6px;display:none;flex-direction:column;gap:4px;z-index:30;min-width:150p
 .host{background:var(--panel);border:1px solid var(--line);border-left-width:4px;border-radius:10px;margin-bottom:10px;overflow:hidden;}
 .host>summary{list-style:none;cursor:pointer;padding:11px 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
 .host>summary::-webkit-details-marker{display:none;}
+/* rotating disclosure caret so host / section rows read as expandable */
+.caret{display:inline-block;flex:0 0 auto;color:var(--muted);font-size:11px;line-height:1;transition:transform .15s ease;transform:rotate(0deg);}
+details[open]>summary>.caret{transform:rotate(90deg);}
+summary:hover>.caret{color:var(--accent);}
 .host .hname{font-weight:600;font-size:15px;word-break:break-all;}
 .host .hmeta{color:var(--muted);font-size:12px;margin-left:auto;}
 .host .body{padding:0 14px 12px;}
@@ -947,9 +1170,20 @@ padding:6px;display:none;flex-direction:column;gap:4px;z-index:30;min-width:150p
 .host .row{font-size:13px;padding:2px 0;word-break:break-all;}
 .host .fchip{display:inline-block;font-size:11px;padding:1px 7px;border-radius:5px;color:#07101f;margin-right:6px;}
 .hthumb{width:150px;height:92px;object-fit:cover;object-position:top;border:1px solid var(--line);border-radius:6px;cursor:pointer;background:#000;}
-.inst{display:flex;align-items:center;gap:8px;flex-wrap:wrap;border-top:1px solid var(--line);padding:7px 0;}
+.inst{display:flex;align-items:center;gap:8px;flex-wrap:wrap;border-top:1px solid var(--line);padding:5px 0;}
 .inst .it{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--accent);word-break:break-all;flex:1;min-width:160px;}
 .sbtn.mini{padding:2px 6px;font-size:11px;}
+.sdot{display:inline-block;width:9px;height:9px;border-radius:50%;flex:0 0 auto;}
+.statustag.mini{font-size:10px;padding:0 6px;opacity:.9;}
+.inst details.rowtri{flex:1 1 100%;margin:3px 0 1px;}
+.inst details.rowtri>summary{list-style:none;cursor:pointer;color:var(--muted);font-size:11px;display:inline-block;padding:1px 7px;border:1px solid var(--line);border-radius:5px;}
+.inst details.rowtri>summary::-webkit-details-marker{display:none;}
+.inst details.rowtri[open]>summary{margin-bottom:6px;color:var(--accent);}
+.inst .statusrow{margin:4px 0;}
+.gsum{font-size:11px;color:var(--muted);margin-left:2px;}
+.gsum b{color:var(--text);font-weight:600;}
+.gmore{margin-top:8px;background:var(--panel);border:1px solid var(--line);color:var(--accent);padding:5px 12px;border-radius:6px;cursor:pointer;font-size:12px;}
+.gmore:hover{border-color:var(--accent);}
 .host details.sec>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;}
 .host details.sec>summary::-webkit-details-marker{display:none;}
 .h4lbl{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;font-weight:600;}
@@ -1004,6 +1238,9 @@ const BANDS = ['info','low','medium','high','critical'];  // index 1..5 via rank
 let DATA={findings:[],assets:[],removed:[]}, SHOTS=[], SHOTMAP={}, TECHMAP={}, TAB='overview';
 let sevFilter=new Set(), statusFilter=new Set(), typeFilter='';
 let juicyOnly=false, newOnly=false, groupSimilar=false, selIdx=-1;
+const GROUP_LIMIT=40;              // affected targets shown before "show all"
+const expandedGroups=new Set();    // group signatures the user expanded
+function expandGroup(sig){expandedGroups.add(sig);renderFindings();}
 let HOSTCMDS={};  // host -> deduped recon command list, for "copy all"
 
 function esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
@@ -1015,15 +1252,19 @@ function q(){return document.getElementById('search').value.toLowerCase().trim()
 function rankBand(r){return BANDS[Math.max(0,Math.min(5,r)-1)]||'info';}
 function fmt(n){if(!n)return'';const u=['B','KB','MB'];let i=0,v=n;while(v>=1024&&i<2){v/=1024;i++;}return v.toFixed(v<10&&i>0?1:0)+u[i];}
 
+/* display host: hostname when BBOT resolved one, else the IP */
+function H(ev){return (ev&&(ev.dhost||ev.host))||'';}
+
 function matchQ(ev){const s=q();if(!s)return true;
-  return (ev.text||'').toLowerCase().includes(s)||(ev.host||'').toLowerCase().includes(s)
+  return (ev.text||'').toLowerCase().includes(s)||H(ev).toLowerCase().includes(s)
+    ||(ev.host||'').toLowerCase().includes(s)
     ||(ev.title||'').toLowerCase().includes(s)||(ev.type||'').toLowerCase().includes(s)
     ||(ev.module||'').toLowerCase().includes(s);}
 
 /* screenshot <-> host linking */
 function shotHostOf(it){let s=(it.label||it.file||'').replace(/^https?:\/\//,'');
   return s.split('/')[0].split(':')[0].toLowerCase();}
-function thumbFor(ev){if(!ev.host)return null;return SHOTMAP[ev.host.toLowerCase()]||null;}
+function thumbFor(ev){const h=H(ev);if(!h)return null;return SHOTMAP[h.toLowerCase()]||SHOTMAP[(ev.host||'').toLowerCase()]||null;}
 function techFor(host){return (host&&TECHMAP[host.toLowerCase()])||[];}
 function shotTechs(it){return (it.gwtech&&it.gwtech.length)?it.gwtech:techFor(shotHostOf(it));}
 function techChips(techs,limit){if(!techs||!techs.length)return'';limit=limit||8;
@@ -1095,7 +1336,7 @@ function buildHosts(){
   function slot(h){if(!m[h])m[h]={host:h,findings:[],ports:[],urls:[],tech:[],other:[],
     juicy:new Set(),maxsev:0,anyNew:false,shot:null};return m[h];}
   [...DATA.findings,...DATA.assets].forEach(ev=>{
-    const h=(ev.host||'').toLowerCase();if(!h)return;const s=slot(h);
+    const h=H(ev).toLowerCase();if(!h)return;const s=slot(h);
     (ev.juicy||[]).forEach(j=>s.juicy.add(j));
     if(ev.is_new)s.anyNew=true;
     if(!s.shot)s.shot=SHOTMAP[h]||null;
@@ -1117,6 +1358,7 @@ function hostMatches(s){const qq=q();
     .some(ev=>matchQ(ev));
 }
 function renderHosts(){
+  flushNotes();
   HOSTCMDS={};
   const hosts=buildHosts().filter(hostMatches);
   let h='<div class="bar">';
@@ -1128,6 +1370,7 @@ function renderHosts(){
     const band=rankBand(s.maxsev),acc=s.maxsev?SEVC[band]:'#2a3342';
     const open=(s.maxsev>=3||s.juicy.size||(COMPARE&&s.anyNew))?' open':'';
     h+=`<details class="host"${open} style="border-left-color:${acc}"><summary>`;
+    h+=`<span class="caret">&#9656;</span>`;
     if(s.maxsev)h+=`<span class="sev-dot" style="background:${acc}"></span>`;
     h+=`<span class="hname">${esc(s.host)}</span>`;
     if(s.juicy.size)h+=`<span class="star" title="${esc([...s.juicy].join(', '))}">&#9733;</span>`;
@@ -1144,7 +1387,7 @@ function renderHosts(){
           <span class="statustag" style="background:${st.color}">${st.label}</span></div>`;});
       h+='</div>';}
     if(hc.length){
-      h+=`<details class="sec"><summary><span class="h4lbl">Recon commands (${hc.length})</span> <button class="copy" onclick="${hx('event.stopPropagation();copyAllHost('+JSON.stringify(s.host)+')')}">copy all</button></summary>`;
+      h+=`<details class="sec"><summary><span class="caret">&#9656;</span><span class="h4lbl">Recon commands (${hc.length})</span> <button class="copy" onclick="${hx('event.stopPropagation();copyAllHost('+JSON.stringify(s.host)+')')}">copy all</button></summary>`;
       hc.forEach(c=>h+=`<div class="cmd"><code>${esc(c[1])}</code><button class="copy" onclick="${hx('copy('+JSON.stringify(c[1])+')')}">copy</button></div>`);
       h+='</details>';}
     if(s.ports.length){h+='<div class="sec"><h4>Open ports</h4>';
@@ -1185,7 +1428,7 @@ function copyAllHost(host){const hc=HOSTCMDS[host]||[];if(!hc.length)return;
 /* ---------------- FINDINGS ---------------- */
 function statusButtons(ev,mini){
   return STATUSES.map((s,i)=>{const on=ev.triage.status===s.key;
-    return `<button class="sbtn ${mini?'mini':''} ${on?'on':''}" style="${on?('background:'+s.color):''}"
+    return `<button class="sbtn ${mini?'mini':''} ${on?'on':''}" data-eid="${ev.id}" data-sk="${s.key}" style="${on?('background:'+s.color):''}"
       onclick="setStatus('${ev.id}','${s.key}')" title="key ${i+1}">${s.label}</button>`;}).join('');
 }
 function badges(ev){let b='';
@@ -1203,9 +1446,9 @@ function playbookHTML(ev){let h='';
   return h;}
 function cardHTML(ev,idx){
   const sc=SEVC[ev.priority]||'#5c6b7e',st=SMAP[ev.triage.status]||STATUSES[0];
-  const tgt=ev.url||(ev.port?`${ev.host}:${ev.port}`:ev.host)||ev.data_str.slice(0,90);
+  const tgt=ev.url||(ev.port?`${H(ev)}:${ev.port}`:H(ev))||ev.data_str.slice(0,90);
   const thumb=thumbFor(ev);
-  let h=`<div class="card ${idx===selIdx?'sel':''}" style="border-left-color:${sc}" id="card-${ev.id}" data-idx="${idx}">`;
+  let h=`<div class="card ${idx===selIdx?'sel':''}" style="border-left-color:${sc}" id="card-${ev.id}" data-eid="${ev.id}" data-idx="${idx}">`;
   if(thumb)h+=`<img class="cardthumb" src="${thumb.src}" onclick="${hx('event.stopPropagation();openImg('+JSON.stringify(thumb.src)+','+JSON.stringify(tgt)+')')}">`;
   h+=`<h3><span class="sevtag" style="background:${sc}">${ev.priority}</span>${esc(ev.title)}
       <span class="statustag" style="background:${st.color}">${st.label}</span></h3>`;
@@ -1215,13 +1458,15 @@ function cardHTML(ev,idx){
   if(ev.why)h+=`<div class="why">${esc(ev.why)}</div>`;
   h+=playbookHTML(ev);
   h+=`<div class="statusrow">${statusButtons(ev,false)}</div>`;
-  h+=`<textarea class="notes" placeholder="tester notes (autosaves)..." onblur="saveNotes('${ev.id}',this.value)">${esc(ev.triage.notes||'')}</textarea>`;
+  h+=`<textarea class="notes" placeholder="tester notes (autosaves)..." oninput="noteInput('${ev.id}',this.value)" onblur="saveNotes('${ev.id}',this.value)">${esc(ev.triage.notes||'')}</textarea>`;
   h+=`</div>`;return h;
 }
 function groupHTML(sig,items){
   const rep=items[0],sc=SEVC[rep.priority]||'#5c6b7e';
   const anyNew=COMPARE&&items.some(i=>i.is_new);
   const juicy=new Set();items.forEach(i=>(i.juicy||[]).forEach(j=>juicy.add(j)));
+  // status breakdown across the group, in workflow order
+  const cnt={};items.forEach(ev=>{const k=ev.triage.status||'new';cnt[k]=(cnt[k]||0)+1;});
   let h=`<div class="card" style="border-left-color:${sc}">`;
   h+=`<h3><span class="sevtag" style="background:${sc}">${rep.priority}</span>${esc(rep.title)}
       <span class="muted">x${items.length}</span></h3>`;
@@ -1231,16 +1476,28 @@ function groupHTML(sig,items){
   h+=`<div class="sub">${esc(rep.type)} &middot; ${esc(rep.module||'-')}</div>`;
   if(rep.why)h+=`<div class="why">${esc(rep.why)}</div>`;
   h+=playbookHTML(rep);
-  h+=`<div class="sec" style="margin-top:8px"><h4 style="margin:0 0 4px;font-size:12px;color:var(--muted)">Affected targets</h4>`;
-  items.forEach(ev=>{const tgt=ev.url||(ev.port?`${ev.host}:${ev.port}`:ev.host)||ev.data_str.slice(0,90);
+  // --- affected targets: compact, scannable, paginated, drill-down per row ---
+  const expanded=expandedGroups.has(sig);
+  const shown=expanded?items:items.slice(0,GROUP_LIMIT);
+  let sum='';STATUSES.forEach(s=>{if(cnt[s.key])sum+=`<span class="gsum"><span class="sev-dot" style="background:${s.color}"></span><b>${cnt[s.key]}</b> ${esc(s.label.toLowerCase())}</span>&nbsp; `;});
+  h+=`<div class="sec" style="margin-top:8px"><h4 style="margin:0 0 4px;font-size:12px;color:var(--muted)">Affected targets (${items.length})</h4>`;
+  if(sum)h+=`<div style="margin:2px 0 6px">${sum}</div>`;
+  shown.forEach(ev=>{const tgt=ev.url||(ev.port?`${H(ev)}:${ev.port}`:H(ev))||ev.data_str.slice(0,120);
     const st=SMAP[ev.triage.status]||STATUSES[0];
-    h+=`<div class="inst"><span class="it" onclick="${hx('copy('+JSON.stringify(tgt)+')')}">${esc(tgt)}
-      <span class="statustag" style="background:${st.color}">${st.label}</span></span>
-      <span>${statusButtons(ev,true)}</span>
-      <input class="notes" style="min-height:28px;flex:1 1 100%" placeholder="notes..." value="${esc(ev.triage.notes||'')}" onblur="saveNotes('${ev.id}',this.value)"></div>`;});
+    h+=`<div class="inst" data-eid="${ev.id}">
+      <span class="sdot" style="background:${st.color}" title="${esc(st.label)}"></span>
+      <span class="it" onclick="${hx('copy('+JSON.stringify(tgt)+')')}" title="click to copy">${esc(tgt)}</span>
+      <span class="statustag mini" style="background:${st.color}">${esc(st.label)}</span>
+      <details class="rowtri"><summary>triage</summary>
+        <div class="statusrow">${statusButtons(ev,true)}</div>
+        <input class="notes" style="min-height:28px;width:100%" placeholder="notes..." value="${esc(ev.triage.notes||'')}" oninput="noteInput('${ev.id}',this.value)" onblur="saveNotes('${ev.id}',this.value)">
+      </details></div>`;});
+  if(!expanded&&items.length>GROUP_LIMIT)
+    h+=`<button class="gmore" onclick="${hx('expandGroup('+JSON.stringify(sig)+')')}">show all ${items.length} targets</button>`;
   h+='</div></div>';return h;
 }
 function renderFindings(){
+  flushNotes();                 // persist any in-progress notes before rebuilding the DOM
   const list=filteredFindings();
   let h='<div class="bar">severity:';
   ['critical','high','medium','low','info'].forEach(s=>{
@@ -1271,10 +1528,11 @@ function renderFindings(){
 
 /* ---------------- ASSETS ---------------- */
 function renderAssets(){
+  flushNotes();
   let rows=DATA.assets.filter(matchQ).filter(ev=>!typeFilter||ev.type===typeFilter);
   if(juicyOnly)rows=rows.filter(ev=>ev.juicy&&ev.juicy.length);
   if(newOnly)rows=rows.filter(ev=>ev.is_new);
-  rows.sort((a,b)=>a.type.localeCompare(b.type)||(a.host||'').localeCompare(b.host||''));
+  rows.sort((a,b)=>a.type.localeCompare(b.type)||H(a).localeCompare(H(b)));
   const types={};DATA.assets.forEach(ev=>types[ev.type]=(types[ev.type]||0)+1);
   let h='<div class="bar"><span class="chip '+(typeFilter?'':'on')+'" onclick="setType(\'\')">all</span>';
   Object.entries(types).sort((a,b)=>b[1]-a[1]).forEach(([t,c])=>
@@ -1285,7 +1543,7 @@ function renderAssets(){
   h+=`<span class="muted">${rows.length} shown</span></div>`;
   h+='<p class="muted" style="margin:-4px 0 10px">Click a row for the tester playbook.</p>';
   h+='<table><thead><tr><th></th><th>Type</th><th>Target</th><th>Module</th><th>Tags</th></tr></thead><tbody>';
-  rows.forEach(ev=>{const tgt=ev.url||(ev.port?`${ev.host}:${ev.port}`:ev.host)||ev.data_str;
+  rows.forEach(ev=>{const tgt=ev.url||(ev.port?`${H(ev)}:${ev.port}`:H(ev))||ev.data_str;
     const star=(ev.juicy&&ev.juicy.length)?'<span class="star" title="'+esc(ev.juicy.join(', '))+'">&#9733;</span>':'';
     const nb=(COMPARE&&ev.is_new)?' <span class="newbadge">NEW</span>':'';
     h+=`<tr style="cursor:pointer" onclick="toggleAsset('${ev.id}')"><td>${star}</td><td>${esc(ev.type)}</td>
@@ -1373,17 +1631,58 @@ function updateLbMark(){const box=document.getElementById('lbMark');if(!box)retu
 }
 
 /* ---------------- triage ---------------- */
+/* debounced, coalesced re-renders so a click or keystroke never rebuilds the
+   whole list synchronously more than once per frame-ish */
+const _rq={};
+function schedule(name,fn,ms){clearTimeout(_rq[name]);_rq[name]=setTimeout(fn,ms||120);}
+
+/* --- note autosave: survives re-renders, tab switches and page unload --- */
+const noteDrafts={}, noteTimers={};
+function noteInput(id,val){
+  noteDrafts[id]=val;
+  clearTimeout(noteTimers[id]);
+  noteTimers[id]=setTimeout(()=>saveNotes(id,val,true),600);
+}
+function flushNotes(){                 // save every pending draft immediately
+  Object.keys(noteDrafts).forEach(id=>{
+    clearTimeout(noteTimers[id]);
+    saveNotes(id,noteDrafts[id],true);
+  });
+}
+window.addEventListener('beforeunload',flushNotes);
+document.addEventListener('visibilitychange',()=>{if(document.hidden)flushNotes();});
+
+/* update only the status visuals for one finding, in place (no list rebuild) */
+function paintStatus(id){
+  const ev=findEv(id);if(!ev)return;
+  const st=SMAP[ev.triage.status]||STATUSES[0];
+  document.querySelectorAll('[data-eid="'+id+'"]').forEach(box=>{
+    box.querySelectorAll('.statustag').forEach(t=>{t.style.background=st.color;t.textContent=st.label;});
+    box.querySelectorAll('.sdot').forEach(d=>{d.style.background=st.color;d.title=st.label;});
+    box.querySelectorAll('.sbtn[data-sk]').forEach(b=>{const on=b.getAttribute('data-sk')===ev.triage.status;
+      b.classList.toggle('on',on);b.style.background=on?st.color:'';});
+  });
+}
 function setStatus(id,status){
+  const ev0=findEv(id);if(ev0)ev0.triage={...ev0.triage,status};  // optimistic
+  paintStatus(id);
+  toast('status: '+(SMAP[status]?SMAP[status].label:status));
   fetch('/api/triage',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({id,status})}).then(r=>r.json()).then(res=>{
-    const ev=findEv(id);if(ev)ev.triage=res;
-    toast('status: '+(SMAP[status]?SMAP[status].label:status));
-    if(TAB==='findings')renderFindings();if(TAB==='overview')renderOverview();if(TAB==='hosts')renderHosts();});
+    const ev=findEv(id);if(ev)ev.triage=res;paintStatus(id);
+    // the item may now fall outside an active status filter -> re-render (debounced)
+    if(TAB==='findings'&&statusFilter.size)schedule('find',renderFindings,150);
+    schedule('ov',renderOverview,200);
+    if(TAB==='hosts')schedule('hosts',renderHosts,250);
+  }).catch(()=>toast('status save failed'));
 }
-function saveNotes(id,notes){
+function saveNotes(id,notes,quiet){
   fetch('/api/triage',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({id,notes})}).then(r=>r.json()).then(res=>{
-    const ev=findEv(id);if(ev)ev.triage=res;toast('notes saved');});
+    const ev=findEv(id);if(ev)ev.triage=res;
+    if(noteDrafts[id]===notes)delete noteDrafts[id];   // draft is now persisted
+    if(!quiet)toast('notes saved');
+  }).catch(()=>toast('notes save failed'));
 }
 function findEv(id){return DATA.findings.find(e=>e.id===id)||DATA.assets.find(e=>e.id===id);}
 
@@ -1395,7 +1694,7 @@ function toggleAsset(id){const r=document.getElementById('ax-'+id);if(r)r.style.
 function toggleJuicy(){juicyOnly=!juicyOnly;rerender();}
 function toggleNew(){newOnly=!newOnly;rerender();}
 function toggleGroup(){groupSimilar=!groupSimilar;selIdx=-1;renderFindings();}
-function rerender(){if(TAB==='findings')renderFindings();else if(TAB==='assets')renderAssets();else if(TAB==='hosts')renderHosts();}
+function rerender(){if(TAB==='findings')renderFindings();else if(TAB==='assets')renderAssets();else if(TAB==='hosts')renderHosts();else if(TAB==='shots')renderShots();}
 
 function show(tab){TAB=tab;selIdx=-1;
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
@@ -1406,9 +1705,7 @@ function show(tab){TAB=tab;selIdx=-1;
   else if(tab==='shots')renderShots();
 }
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>show(b.dataset.tab));
-document.getElementById('search').addEventListener('input',()=>{
-  if(TAB==='findings')renderFindings();else if(TAB==='assets')renderAssets();
-  else if(TAB==='shots')renderShots();else if(TAB==='hosts')renderHosts();});
+document.getElementById('search').addEventListener('input',()=>schedule('search',rerender,180));
 
 /* export menu */
 const exBtn=document.getElementById('exBtn'),exMenu=document.getElementById('exMenu');
@@ -1447,7 +1744,7 @@ Promise.all([
   SHOTS=shots.map(it=>({...it,status:it.status||'new',src:'/img/'+it.rel.split('/').map(encodeURIComponent).join('/')}));
   SHOTMAP={};SHOTS.forEach(it=>{const h=shotHostOf(it);if(h&&!SHOTMAP[h])SHOTMAP[h]=it;});
   TECHMAP={};[...DATA.findings,...DATA.assets].forEach(ev=>{
-    if(ev.tech&&ev.host){const h=ev.host.toLowerCase();(TECHMAP[h]=TECHMAP[h]||[]);
+    if(ev.tech&&H(ev)){const h=H(ev).toLowerCase();(TECHMAP[h]=TECHMAP[h]||[]);
       if(!TECHMAP[h].includes(ev.tech))TECHMAP[h].push(ev.tech);}});
   show('overview');
 });
@@ -1486,7 +1783,7 @@ class Handler(BaseHTTPRequestHandler):
     # ---- client view of an event (+ live triage state) ----
     def _client_event(self, ev):
         d = {k: ev[k] for k in ("id", "type", "module", "tags", "data_str", "host",
-                                "url", "port", "scheme", "priority", "title", "why",
+                                "dhost", "url", "port", "scheme", "priority", "title", "why",
                                 "playbook", "commands", "text", "lane", "juicy", "tech")}
         d["triage"] = self.store.get(ev["id"])
         d["is_new"] = self.compare_active and ev["id"] not in self.prev_ids
