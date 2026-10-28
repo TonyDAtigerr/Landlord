@@ -171,6 +171,53 @@ def _nuclei_template_id(ev):
     return m.group(1).strip() if m else ""
 
 
+def _nuclei_enrich(ev):
+    """Build a finding-specific title / description / playbook for a nuclei hit
+    from what it actually matched (template id, name, extracted data, CVE,
+    severity, URL) - never the generic 'a nuclei template matched' blurb."""
+    blob = (ev.get("data_str", "") or "") + " " + (ev.get("desc", "") or "")
+    tid = _nuclei_template_id(ev)
+    name = _nuclei_name(ev)
+    mx = re.search(r"Extracted Data:\s*\[([^\]]*)\]", blob, re.I)
+    extracted = (mx.group(1).strip() if mx else "")
+    cves = list(dict.fromkeys(c.upper() for c in re.findall(r"CVE-\d{4}-\d{4,7}", blob, re.I)))
+    sev = (ev.get("severity") or ev.get("priority") or "info")
+    url = ev.get("url") or ev.get("dhost") or ev.get("host") or "the asset"
+    title = name or tid or "Nuclei template match"
+
+    lead = name or tid or "a nuclei template"
+    idpart = (" (template %s)" % tid) if (tid and name) else ""
+    parts = ["Nuclei matched %s%s on %s." % (lead, idpart, url)]
+    if extracted:
+        parts.append("Matched/extracted value: %s" %
+                     (extracted if len(extracted) <= 300 else extracted[:300] + "…"))
+    if cves:
+        parts.append("Linked CVE(s): %s." % ", ".join(cves))
+    parts.append("Reported severity: %s." % sev)
+    desc = " ".join(parts)
+
+    play = []
+    play.append("What it checked: open template '%s' on github.com/projectdiscovery/nuclei-templates "
+                "(search the id) to read its matcher and what it proves." % (tid or name or "<template>"))
+    if tid and (ev.get("url") or url):
+        play.append("Reproduce and capture evidence: nuclei -id %s -u '%s' -debug."
+                    % (tid, ev.get("url") or url))
+    if extracted:
+        play.append("Verify the match is real: check the extracted value above against %s and "
+                    "rule out a loose matcher / false positive." % url)
+    if cves:
+        play.append("For %s: pull a public PoC, confirm the affected version is actually running, "
+                    "and assess reachability and real impact before reporting." % ", ".join(cves))
+    elif SEV_RANK.get(str(sev).lower(), 0) <= 2:
+        play.append("This is a %s-severity detection - usually fingerprinting or low-impact exposure. "
+                    "Confirm it has concrete security impact before reporting; otherwise mark it "
+                    "reviewed / not exploitable." % sev)
+    else:
+        play.append("Treat as a real finding: confirm the impact on %s and document a clean "
+                    "request/response PoC." % url)
+    return title, desc, play
+
+
 RULES = [
     # --- module-keyed rules first: a BBOT module name is the least ambiguous
     #     signal, and these findings often carry no CVE/keyword text to match on.
@@ -480,10 +527,8 @@ def enrich(ev):
         try:
             if pred(ev):
                 if name == "Nuclei template match":
-                    # title the finding by its real template name, not generically
-                    nm = _nuclei_name(ev)
-                    if nm:
-                        name = nm
+                    # replace the generic nuclei blurb with finding-specific detail
+                    return _nuclei_enrich(ev)
                 return name, desc, list(play)
         except Exception:
             continue
@@ -1309,6 +1354,8 @@ padding:2px 7px;border-radius:5px;color:#07101f;}
 .tgt{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:var(--accent);
 cursor:pointer;word-break:break-all;}
 .tgt:hover{text-decoration:underline;}
+.detail{margin:7px 0;padding:7px 9px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;font-size:12.5px;color:var(--text);word-break:break-word;white-space:pre-wrap;}
+.detail .lbl{color:var(--muted);font-weight:600;margin-right:6px;}
 .why{margin:7px 0;color:var(--text);}
 .sub{font-size:12px;color:var(--muted);}
 details{margin-top:8px;}
@@ -1667,6 +1714,13 @@ function badges(ev){let b='';
   if(COMPARE&&ev.is_new)b+='<span class="newbadge">NEW</span> ';
   if(ev.juicy&&ev.juicy.length)ev.juicy.forEach(j=>b+=`<span class="juicytag">&#9733; ${esc(j)}</span> `);
   return b;}
+function reportedHTML(ev){
+  // the scanner's own text for this exact finding - the ground truth of what was found
+  const d=ev.data_str||'';
+  if(ev.lane!=='finding'||!d)return '';
+  if(d===ev.why||d===ev.title)return '';
+  return `<div class="detail"><span class="lbl">Reported</span>${esc(d)}</div>`;
+}
 function playbookHTML(ev){let h='';
   if(ev.playbook&&ev.playbook.length){
     h+=`<details open><summary>What a tester can do</summary><ul class="play">`;
@@ -1688,6 +1742,7 @@ function cardHTML(ev,idx){
   h+=`<div class="tgt" onclick="${hx('copy('+JSON.stringify(tgt)+')')}" title="click to copy">${esc(tgt)}</div>`;
   h+=`<div class="sub">${esc(ev.type)} &middot; ${esc(ev.module||'-')}${ev.tags.length?' &middot; '+esc(ev.tags.join(', ')):''}</div>`;
   if(ev.why)h+=`<div class="why">${esc(ev.why)}</div>`;
+  h+=reportedHTML(ev);
   h+=playbookHTML(ev);
   h+=`<div class="statusrow">${statusButtons(ev,false)}</div>`;
   h+=`<textarea class="notes" placeholder="tester notes (autosaves)..." oninput="noteInput('${ev.id}',this.value)" onblur="saveNotes('${ev.id}',this.value)">${esc(ev.triage.notes||'')}</textarea>`;
@@ -1707,6 +1762,7 @@ function groupHTML(sig,items){
   if(b)h+=`<div>${b}</div>`;
   h+=`<div class="sub">${esc(rep.type)} &middot; ${esc(rep.module||'-')}</div>`;
   if(rep.why)h+=`<div class="why">${esc(rep.why)}</div>`;
+  h+=reportedHTML(rep);
   h+=playbookHTML(rep);
   // --- affected targets: compact, scannable, paginated, drill-down per row ---
   const expanded=expandedGroups.has(sig);
