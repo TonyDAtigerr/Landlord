@@ -181,6 +181,26 @@ CATEGORY_COLORS = {
     "gcp": "DB4437", "out": "C62828", "unresolved": "757575",
 }
 
+# Plain in-scope verdict per category, for the "In Scope" report column. Cloud
+# categories are deliberately "Review (cloud)" rather than Yes/No: the host
+# resolves into a provider's published ranges but is not in the agreed IP scope,
+# so ownership and the provider's testing authorisation must be confirmed first.
+SCOPE_STATUS = {
+    "scope": "Yes",
+    "out": "No",
+    "aws": "Review (cloud)",
+    "azure": "Review (cloud)",
+    "azure-gov": "Review (cloud)",
+    "gcp": "Review (cloud)",
+    "unresolved": "Unresolved",
+}
+SCOPE_STATUS_COLORS = {
+    "Yes": "2E7D32",             # green
+    "No": "C62828",              # red
+    "Review (cloud)": "F9A825",  # amber
+    "Unresolved": "757575",      # grey
+}
+
 
 def export_xlsx(path, results, unresolved, client=None, assessor=None):
     """Write a client-ready workbook: Hosts, Summary (with charts), Cloud Services."""
@@ -222,34 +242,41 @@ def export_xlsx(path, results, unresolved, client=None, assessor=None):
     # ---- Hosts sheet ---------------------------------------------------------
     ws = wb.active
     ws.title = "Hosts"
-    cols = ["Hostname", "IP Address", "IP Version", "Classification", "Provider / Service", "Notes"]
+    cols = ["Hostname", "IP Address", "IP Version", "Classification", "In Scope", "Provider / Service", "Notes"]
     header(ws, 1, cols)
     rows = sorted(results, key=lambda r: (cats.index(r["category"]), r["host"], r["ip"]))
     r_i = 2
     for r in rows:
+        st = SCOPE_STATUS.get(r["category"], "Review (cloud)")
         vals = [r["host"], r["ip"], "IPv6" if ":" in r["ip"] else "IPv4",
-                CATEGORY_LABELS[r["category"]], r["match"] if r["category"] != "scope" else "", ""]
+                CATEGORY_LABELS[r["category"]], st,
+                r["match"] if r["category"] != "scope" else "", ""]
         for c_i, v in enumerate(vals, 1):
             cell = ws.cell(row=r_i, column=c_i, value=v)
             cell.font, cell.border = body, box
         ws.cell(row=r_i, column=4).fill = PatternFill("solid", fgColor=CATEGORY_COLORS[r["category"]])
         ws.cell(row=r_i, column=4).font = Font(name=FONT, color="FFFFFF", bold=True)
+        ws.cell(row=r_i, column=5).fill = PatternFill("solid", fgColor=SCOPE_STATUS_COLORS[st])
+        ws.cell(row=r_i, column=5).font = Font(name=FONT, color="FFFFFF", bold=True)
         r_i += 1
     for h in unresolved:
-        vals = [h, "", "", CATEGORY_LABELS["unresolved"], "", "No DNS record found at time of assessment"]
+        vals = [h, "", "", CATEGORY_LABELS["unresolved"], SCOPE_STATUS["unresolved"], "",
+                "No DNS record found at time of assessment"]
         for c_i, v in enumerate(vals, 1):
             cell = ws.cell(row=r_i, column=c_i, value=v)
             cell.font, cell.border = body, box
         ws.cell(row=r_i, column=4).fill = PatternFill("solid", fgColor=CATEGORY_COLORS["unresolved"])
         ws.cell(row=r_i, column=4).font = Font(name=FONT, color="FFFFFF", bold=True)
+        ws.cell(row=r_i, column=5).fill = PatternFill("solid", fgColor=SCOPE_STATUS_COLORS["Unresolved"])
+        ws.cell(row=r_i, column=5).font = Font(name=FONT, color="FFFFFF", bold=True)
         r_i += 1
     last = r_i - 1
     if last >= 2:
-        tbl = Table(displayName="Hosts", ref="A1:F%d" % last)
+        tbl = Table(displayName="Hosts", ref="A1:G%d" % last)
         tbl.tableStyleInfo = TableStyleInfo(name="TableStyleLight1", showRowStripes=True)
         ws.add_table(tbl)
     ws.freeze_panes = "A2"
-    autosize(ws, [42, 40, 11, 22, 38, 45])
+    autosize(ws, [42, 40, 11, 22, 16, 38, 45])
 
     # ---- Summary sheet (counts are live formulas over the Hosts sheet) ---------
     ss = wb.create_sheet("Summary", 0)
@@ -311,7 +338,7 @@ def export_xlsx(path, results, unresolved, client=None, assessor=None):
         cs.cell(row=i, column=1, value=prov).font = body
         cs.cell(row=i, column=2, value=svc).font = body
         cs.cell(row=i, column=3,
-                value='=COUNTIFS(Hosts!$D:$D,A%d,Hosts!$E:$E,B%d&"*")' % (i, i)).font = body
+                value='=COUNTIFS(Hosts!$D:$D,A%d,Hosts!$F:$F,B%d&"*")' % (i, i)).font = body
         for c in range(1, 4):
             cs.cell(row=i, column=c).border = box
     autosize(cs, [22, 30, 10])
@@ -345,6 +372,12 @@ def export_xlsx(path, results, unresolved, client=None, assessor=None):
          "(not in the agreed scope). Testing may be covered by the provider's blanket policy.", body),
         ("Out of scope: IP is in none of the above; it may be a third party, a CDN, or on-prem.", body),
         ("Did not resolve: no DNS record existed when the data was collected.", body),
+        ("", body),
+        ("In Scope column", bold),
+        ("Yes: the host is within the agreed scope. No: out of scope. "
+         "Review (cloud): the IP is in a cloud provider's ranges and not in the agreed IP "
+         "scope - confirm asset ownership and obtain the provider's testing authorisation "
+         "before any active testing. Unresolved: no DNS record at collection time.", body),
         ("", body),
         ("Sources", bold),
         ("Azure ranges: %s" % AZURE_PAGES["public"][0], body),
