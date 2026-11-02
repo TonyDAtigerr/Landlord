@@ -13,6 +13,8 @@ serves a dark, searchable web UI that:
     to a sidecar JSON file so your work survives restarts
   * shows the full attack surface (subdomains, ports, URLs, tech, emails...) in
     an Assets view, the GUI version of bbot_organizer
+  * collects every URL BBOT found into one copy-ready list (URLs tab) for
+    feeding feroxbuster/ffuf or Burp's target scope
   * embeds a shotview-style screenshot gallery as its own tab
 
 Usage:
@@ -26,9 +28,12 @@ Triage state is saved next to the input as <input>.bscope.json unless you pass
 """
 
 import argparse
+import base64
 import csv
+import gzip
 import hashlib
 import html
+import io
 import ipaddress
 import json
 import os
@@ -39,6 +44,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -562,8 +568,9 @@ def enrich(ev):
     # and name the producing module so the tester knows where to look it up.
     if ev["lane"] == "finding":
         mod = ev.get("module") or ""
-        title = "%s%s" % (ev["type"].replace("_", " ").title(),
-                          (" (%s)" % mod) if mod else "")
+        fname = ev.get("fname") or ""
+        title = fname or ("%s%s" % (ev["type"].replace("_", " ").title(),
+                                    (" (%s)" % mod) if mod else ""))
         desc = ("A finding was reported%s that matches no built-in playbook. Read the "
                 "finding text below for the exact issue it reports." %
                 (" by BBOT's '%s' module" % mod if mod else ""))
@@ -581,6 +588,82 @@ def enrich(ev):
             "Discovered during the scan; review in context of the surrounding assets.",
             ["Correlate with other findings on the same host.",
              "Decide if it widens the attack surface or confirms an existing lead."])
+
+
+# --------------------------------------------------------------------------- #
+#  Remediation: DERIVED from the finding itself, never a fixed per-target table.
+# --------------------------------------------------------------------------- #
+# BBOT findings carry no remediation field, but their name/description embed
+# machine-readable signals: nuclei template ids, CVEs, CWEs, vulnerable library
+# names and affected version ranges. We pull references and a fix directive out
+# of those, so the guidance adapts to whatever BBOT returns for any target.
+
+def _finding_references(ev):
+    """References the finding ITSELF points to - CVE->NVD, CWE->MITRE and the
+    nuclei template it matched (where the real remediation/refs live). Scan-
+    agnostic: whatever identifiers the finding carries are what you get."""
+    text = ev.get("text", "") or ""
+    sources = []
+    def add(label, url):
+        pair = [label, url]
+        if url and pair not in sources:
+            sources.append(pair)
+    for cve in sorted({c.upper() for c in re.findall(r"CVE-\d{4}-\d{4,7}", text, re.I)}):
+        add(cve, "https://nvd.nist.gov/vuln/detail/" + cve)
+    for cwe in sorted({c for c in re.findall(r"CWE-(\d{1,5})", text, re.I)}, key=int):
+        add("CWE-" + cwe, "https://cwe.mitre.org/data/definitions/%s.html" % cwe)
+    tid = _nuclei_template_id(ev)
+    if tid:
+        add("nuclei template: " + tid,
+            "https://github.com/search?q=repo%3Aprojectdiscovery%2Fnuclei-templates+"
+            + urllib.parse.quote(tid) + "&type=code")
+    return sources
+
+
+def remediation(ev):
+    """Return (remediation_text, [[label, url], ...]) derived from this finding.
+    The fix directive is chosen from the finding's own signals (vulnerable
+    library + affected range, CVE, nuclei template, else the named issue)."""
+    if ev.get("lane") != "finding":
+        return "", []
+    desc = ev.get("desc", "") or ev.get("data_str", "") or ""
+    text = ev.get("text", "") or ""
+    name = (ev.get("title") or ev.get("fname") or "this finding").strip()
+    sources = _finding_references(ev)
+    cves = sorted({c.upper() for c in re.findall(r"CVE-\d{4}-\d{4,7}", text, re.I)})
+    msg = []
+
+    lib_m = re.search(r"library detected:\s*(.+?)\s+v?([0-9][\w.\-]*)", desc, re.I)
+    aff_m = re.search(r"affected versions?:\s*(.+)$", desc, re.I | re.M)
+    if _mod(ev, "retirejs") or ("vulnerable" in text.lower() and "librar" in text.lower()):
+        lib = ("%s %s" % (lib_m.group(1).strip(), lib_m.group(2).strip())) if lib_m else "the affected library"
+        extra = (" (affected range %s)" % aff_m.group(1).strip()) if aff_m else ""
+        msg.append("Upgrade %s to a version outside the vulnerable range%s and redeploy; "
+                   "remove the bundled vulnerable copy." % (lib, extra))
+    elif cves:
+        msg.append("Patch the affected software to a release that fixes %s, after "
+                   "confirming the deployed version is actually in the affected range."
+                   % ", ".join(cves))
+    elif _mod(ev, "nuclei"):
+        tid = _nuclei_template_id(ev)
+        msg.append("Open the matched nuclei template%s (linked) to see exactly what it "
+                   "checks and its recommended fix, then remediate at the source and rule "
+                   "out a false positive." % ((" '%s'" % tid) if tid else ""))
+    else:
+        msg.append("Confirm \"%s\" on the affected URL, assess its real impact, and apply "
+                   "the standard server/application fix for this issue class." % name)
+
+    if sources:
+        msg.append("Use the reference%s below for the authoritative fix and to verify it."
+                   % ("s" if len(sources) > 1 else ""))
+    else:
+        # nothing machine-readable to cite: derive a lookup from this finding's name
+        sources.append(["Look up: " + name,
+                        "https://duckduckgo.com/?q="
+                        + urllib.parse.quote(name + " vulnerability remediation")])
+        sources.append(["OWASP Web Security Testing Guide",
+                        "https://owasp.org/www-project-web-security-testing-guide/"])
+    return " ".join(msg), sources
 
 
 # Per-service commands for an OPEN_TCP_PORT finding ({h}=host, {p}=port).
@@ -614,6 +697,53 @@ PORT_CMDS = {
 }
 
 
+def _js_library(ev):
+    """Pull library name, version and source URL out of a retire.js
+    'Vulnerable JavaScript Library' finding so a manual check can target it."""
+    d = ev.get("desc", "") or ev.get("text", "") or ""
+    m = re.search(r"detected:\s*([A-Za-z0-9_.\-]+)\s+v([0-9][\w.\-]*)", d, re.I)
+    lib = m.group(1).strip() if m else ""
+    ver = m.group(2).strip() if m else ""
+    u = re.search(r"JavaScript URL:\s*(\S+)", d, re.I)
+    return lib, ver, (u.group(1).strip() if u else "")
+
+
+def _console_js_lib(lib, ver):
+    """A one-line DevTools-console check: prints the library's live version
+    (when it exposes a global) and any <script> whose src names the library -
+    manual confirmation that the flagged version is really loaded in the page."""
+    key = (lib or "").lower()
+    flagged = ("%s v%s" % (lib, ver)) if ver else lib
+    return (
+        "(()=>{const V={jquery:()=>window.jQuery&&jQuery.fn&&jQuery.fn.jquery,"
+        "angular:()=>window.angular&&angular.version&&angular.version.full,"
+        "react:()=>window.React&&React.version,vue:()=>window.Vue&&Vue.version,"
+        "bootstrap:()=>window.bootstrap&&bootstrap.Tooltip&&bootstrap.Tooltip.VERSION,"
+        "moment:()=>window.moment&&moment.version,lodash:()=>window._&&_.VERSION,"
+        "underscore:()=>window._&&_.VERSION,"
+        "swiper:()=>window.Swiper&&(Swiper.version||(Swiper.prototype||{}).version),"
+        "dompurify:()=>window.DOMPurify&&DOMPurify.version,d3:()=>window.d3&&d3.version,"
+        "handlebars:()=>window.Handlebars&&Handlebars.VERSION};"
+        "const k=%s;const f=V[k];"
+        "console.log('live version of '+k+':',(f&&f())||'(no global - likely bundled/minified; read the script source)');"
+        "console.log('matching <script> src:',[...document.scripts].map(s=>s.src).filter(s=>s&&new RegExp(k,'i').test(s)));"
+        "console.log('scan flagged:',%s);})()"
+    ) % (json.dumps(key), json.dumps(flagged))
+
+
+def _console_reflect(web, param):
+    """Console check that shows exactly where a parameter value lands in the
+    response, so the tester can judge the XSS context (HTML / attribute / JS)."""
+    sep = "&" if "?" in web else "?"
+    url = "%s%s%s=bscopeMARK7E" % (web, sep, param)
+    return ("fetch(%s).then(r=>r.text()).then(h=>{"
+            "const m=[...h.matchAll(/.{0,60}bscopeMARK7E.{0,60}/g)];"
+            "console.log(m.length+' reflection(s) of the marker:');"
+            "m.forEach(x=>console.log(x[0]));"
+            "console.log('context key: inside a tag => attribute XSS, inside <script> => JS XSS, "
+            "between tags => HTML XSS');})") % json.dumps(url)
+
+
 def suggest_commands(ev):
     """Build copy-paste commands tailored to what the finding actually is:
     a targeted verification for known finding types (nuclei template re-run,
@@ -628,11 +758,19 @@ def suggest_commands(ev):
     t = ((ev.get("title", "") or "") + " " + (ev.get("text", "") or "")).lower()
     targeted = False
 
-    def add(label, cmd):
-        if cmd and (label, cmd) not in cmds:
-            cmds.append((label, cmd))
+    def add(label, cmd, kind="shell"):
+        if cmd and not any(c[1] == cmd for c in cmds):
+            cmds.append((label, cmd, kind))
 
     # ---- finding-specific verification (most relevant first) ----
+    # structured bits BBOT embeds in the description, e.g. "Name: [param]",
+    # "Categories: [SQL Injection]", "template: [id]".
+    def field(key):
+        m = re.search(r"%s:\s*\[([^\]]+)\]" % re.escape(key), ev.get("desc", "") or "", re.I)
+        return m.group(1).strip() if m else ""
+    param = field("Name") if _mod(ev, "hunt", "reflected_parameters") or "parameter" in t else ""
+    categories = field("Categories").lower()
+
     if _mod(ev, "nuclei"):
         tid = _nuclei_template_id(ev)
         if tid and web:
@@ -648,16 +786,45 @@ def suggest_commands(ev):
             add("Confirm .git exposure", "curl -sSIk '%s/.git/HEAD'" % base)
             add("Dump the repo", "git-dumper '%s/.git/' ./gitdump" % base)
             targeted = True
-    if _mod(ev, "bucket") or "bucket" in t or "s3://" in t or " s3 " in t:
-        if host:
-            add("List bucket (S3)", "aws s3 ls s3://%s --no-sign-request" % host)
+    if _mod(ev, "bucket") or typ == "STORAGE_BUCKET" or "bucket" in t or "s3://" in t or " s3 " in t:
+        burl = (url or web or "").rstrip("/")
+        try:
+            bhost = urllib.parse.urlparse(burl).hostname or ""
+        except Exception:
+            bhost = ""
+        if "amazonaws.com" in bhost or bhost.startswith("s3") or ".s3" in bhost:
+            bucket = bhost.split(".s3")[0] if ".s3" in bhost else (host or bhost)
+            add("List bucket (S3)", "aws s3 ls s3://%s --no-sign-request" % bucket)
+        elif "blob.core.windows.net" in bhost:
+            add("List container (Azure)", "curl -s '%s?restype=container&comp=list'" % burl)
+        elif "storage.googleapis.com" in bhost or ".storage." in bhost:
+            bucket = bhost.split(".storage")[0] if ".storage" in bhost else bhost
+            add("List bucket (GCS)", "gsutil ls -r gs://%s" % bucket)
+        elif burl:
+            add("List bucket contents", "curl -s '%s'" % burl)
+        targeted = True
+    if typ == "CODE_REPOSITORY" or _mod(ev, "github", "gitlab", "git_clone", "code_repository") or "repositor" in t:
+        repo = url or web
+        if repo:
+            add("Clone the repo", "git clone --depth 1 '%s'" % repo)
+            add("Scan it for secrets", "trufflehog git '%s' --only-verified" % repo)
             targeted = True
-    if _mod(ev, "trufflehog") or "leaked" in t or "secret" in t or "credential" in t or "api key" in t:
+    if _mod(ev, "trufflehog", "secretsdb") or "leaked" in t or "secret" in t or "credential" in t or "api key" in t:
         add("Verify the secret", "# test the leaked credential read-only against its own service; do not reuse elsewhere")
         targeted = True
     if _mod(ev, "host_header") or "host header" in t:
         if web:
             add("Host-header injection", "curl -sSIk -H 'Host: evil.example' '%s'" % web)
+            add("X-Forwarded-Host probe", "curl -sSIk -H 'X-Forwarded-Host: evil.example' '%s'" % web)
+            targeted = True
+    if _mod(ev, "iis_shortnames") or "shortname" in t or "short name" in t:
+        if web:
+            add("IIS shortname scan", "shortscan '%s'" % web)
+            targeted = True
+    if _mod(ev, "bypass403") or "403 bypass" in t or "forbidden bypass" in t or "possible 403" in t:
+        if webroot:
+            add("403 bypass sweep", "byp4xx '%s'" % web)
+            add("Path-trick probe", "curl -sSIk '%s/%%2e/' ; curl -sSIk '%s/..;/'" % (webroot, webroot))
             targeted = True
     if _mod(ev, "ntlm") or "ntlm" in t:
         if web:
@@ -672,12 +839,31 @@ def suggest_commands(ev):
     if "cors" in t:
         if web:
             add("CORS misconfig", "curl -sSIk -H 'Origin: https://evil.example' '%s'" % web)
+            add("Manual: test CORS from another origin's console",
+                ("/* open any other site (e.g. https://example.org), then run in its console */ "
+                 "fetch(%s,{credentials:'include'}).then(r=>console.log("
+                 "'Access-Control-Allow-Origin:',r.headers.get('access-control-allow-origin'),"
+                 "'| Allow-Credentials:',r.headers.get('access-control-allow-credentials')))"
+                 ".catch(e=>console.log('request blocked:',e.message))") % json.dumps(web),
+                "console")
             targeted = True
-    if _has(ev, "sql injection", "sqli"):
-        if web:
+    # parameter-level findings: target the EXACT parameter BBOT flagged
+    if _has(ev, "sql injection", "sqli") or "sql injection" in categories:
+        if web and param:
+            add("Confirm SQLi on '%s'" % param, "sqlmap -u '%s' -p %s --batch --level 2 --risk 2" % (web, param))
+        elif web:
             add("Confirm SQLi", "sqlmap -u '%s' --batch --level 2 --risk 2" % web)
-            targeted = True
-    if _has(ev, "cross-site scripting", "xss"):
+        targeted = True
+    if _mod(ev, "reflected_parameters") or "reflected" in t:
+        if web and param:
+            sep = "&" if "?" in web else "?"
+            add("Test reflected '%s'" % param,
+                "curl -sSk '%s%s%s=bscopeMARK7E' | grep -n bscopeMARK7E   # check how '%s' is reflected (HTML/JS/attr) for XSS"
+                % (web, sep, param, param))
+            add("Manual: inspect where '%s' reflects (browser console)" % param,
+                _console_reflect(web, param), "console")
+        targeted = True
+    elif _has(ev, "cross-site scripting", "xss"):
         if web:
             add("Probe XSS context", "curl -sSk '%s'   # inject a benign marker and inspect the reflection context" % web)
             targeted = True
@@ -687,8 +873,39 @@ def suggest_commands(ev):
             targeted = True
     if _mod(ev, "retirejs") or ("vulnerable" in t and ("javascript" in t or ".js" in t)):
         if web:
-            add("Re-check JS libraries", "nuclei -tags tech,javascript -u '%s'" % web)
+            lib, ver, jsurl = _js_library(ev)
+            if lib:
+                add("Manual: confirm %s %s in the page's console" % (lib, ver or ""),
+                    _console_js_lib(lib, ver), "console")
+            if jsurl:
+                add("Manual: read the version from the library source",
+                    "curl -s '%s' | head -c 400" % jsurl)
+            add("Re-check JS libraries", "nuclei -tags tech,javascript,cve -u '%s'" % web)
             targeted = True
+    if _mod(ev, "excavate") or "verbose error" in t or "error message" in t:
+        if web:
+            add("View the error body", "curl -sSk '%s' | sed -n '1,60p'" % web)
+            targeted = True
+    if _mod(ev, "url_manipulation") or "url manipulation" in t:
+        if webroot:
+            add("Extension/response probe", "curl -sSIk '%s/' ; curl -sSIk '%s/?bscope=.jpg'" % (webroot, webroot))
+            targeted = True
+
+    if web and _has(ev, "security header", "missing header", "csp", "content security policy",
+                    "hsts", "strict-transport", "x-content-type", "referrer-policy", "permissions-policy"):
+        add("Manual: read response security headers (browser console)",
+            ("fetch(location.href,{method:'HEAD'}).then(r=>['content-security-policy',"
+             "'strict-transport-security','x-frame-options','x-content-type-options',"
+             "'referrer-policy','permissions-policy'].forEach(k=>console.log(k+':',"
+             "r.headers.get(k)||'(missing)')))"),
+            "console")
+        targeted = True
+    if web and _has(ev, "clickjack", "x-frame", "frame options", "framing", "framable", "frameable"):
+        add("Manual: clickjacking test (save as .html, open in a browser)",
+            '<!doctype html><h3>If the page renders below, it is frameable:</h3>'
+            '<iframe src="%s" width="800" height="600"></iframe>' % web,
+            "manual")
+        targeted = True
 
     # ---- service-specific commands for an open port ----
     if typ == "OPEN_TCP_PORT" and host:
@@ -796,6 +1013,27 @@ def _target_bits(type_, data_str, host_hint, url_hint):
     return host, url, port, scheme
 
 
+def _summarize_dict(d):
+    """A readable one-liner for a dict event that has no description or url of
+    its own (PROTOCOL banners, storage buckets, socials, technologies...), so
+    its distinguishing detail is kept instead of collapsing to just the host.
+    Also what keeps two technologies on one url from sharing an identity."""
+    if not isinstance(d, dict):
+        return ""
+    parts = []
+    for k in ("name", "technology", "platform", "profile_name", "protocol",
+              "port", "banner", "waf", "asn", "tenant-names", "tenant-id",
+              "domain", "repository", "container", "bucket", "title", "http_title"):
+        v = d.get(k)
+        if v in (None, "", [], {}):
+            continue
+        if isinstance(v, (list, tuple)):
+            v = ", ".join(str(x) for x in v if str(x).strip())
+        if str(v).strip():
+            parts.append(str(v).strip())
+    return " ".join(parts).strip()
+
+
 def _normalize(type_, data, module, tags, ip="", resolved=None):
     """Turn a raw event into the normalized dict the UI/knowledge-base use."""
     desc = ""
@@ -808,7 +1046,10 @@ def _normalize(type_, data, module, tags, ip="", resolved=None):
         host = data.get("host", "") or host
         url = data.get("url", "") or ""
         severity = (data.get("severity") or "").lower() or None
-        data_str = desc or url or host or json.dumps(data, ensure_ascii=False)
+        # desc for findings; a field summary for structured non-url events (so a
+        # PROTOCOL banner or two distinct technologies on one url are preserved);
+        # then url / host / raw json as last resorts.
+        data_str = desc or _summarize_dict(data) or url or host             or json.dumps(data, ensure_ascii=False)
     else:
         data_str = str(data)
 
@@ -865,14 +1106,21 @@ def _normalize(type_, data, module, tags, ip="", resolved=None):
     ev["tech"] = tech_name
 
     ev["juicy"] = juicy_tags(host, url or data_str if type_ in ("URL", "URL_UNVERIFIED") else url)
+    # BBOT's own finding name ("Duplicate Host Header Tolerated", etc.) is the
+    # ground-truth label; expose it so enrich() can title generic findings with it.
+    ev["fname"] = (data.get("name", "") if isinstance(data, dict) else "").strip()
     title, description, playbook = enrich(ev)
     ev["title"] = title
     ev["description"] = desc or description
     ev["why"] = description
     ev["playbook"] = playbook
     ev["commands"] = suggest_commands(ev)
+    ev["remediation"], ev["sources"] = remediation(ev)
+    # identity = type + target (host/url/port) + data, matching dedupe_events()'s
+    # key. This gives every distinct finding its own id and its own triage state;
+    # only genuine duplicates (identical on all of these) share an id and collapse.
     ev["id"] = hashlib.sha1(
-        ("%s|%s" % (type_, data_str)).encode("utf-8", "replace")
+        ("%s|%s|%s|%s|%s" % (type_, host, url, port, data_str)).encode("utf-8", "replace")
     ).hexdigest()[:12]
     return ev
 
@@ -901,8 +1149,16 @@ def parse_ndjson(path):
         if not isinstance(r, dict):
             continue
         rh = r.get("resolved_hosts") if isinstance(r.get("resolved_hosts"), list) else []
+        # BBOT serializes dict-valued event data under "data_json" and plain
+        # string data under "data". Reading only "data" silently dropped every
+        # rich event (URL, FINDING, TECHNOLOGY, SOCIAL, STORAGE_BUCKET,
+        # PROTOCOL, URL_HINT...), which is why the URLs tab and most findings
+        # came up empty. Prefer data_json, fall back to data.
+        data = r.get("data_json")
+        if data is None:
+            data = r.get("data", "")
         ev = _normalize(
-            r.get("type", "UNKNOWN"), r.get("data", ""),
+            r.get("type", "UNKNOWN"), data,
             r.get("module", ""), r.get("tags", []),
             ip=(rh[0] if rh else ""), resolved=rh,
         )
@@ -918,6 +1174,13 @@ def parse_csv(path):
         for row in reader:
             type_ = (row.get("Event type") or row.get("type") or "UNKNOWN").strip()
             data = (row.get("Event data") or row.get("data") or "").strip()
+            # BBOT writes dict-valued event data into the CSV as a JSON object;
+            # decode it so URL/FINDING/TECHNOLOGY etc. parse the same as NDJSON.
+            if data[:1] == "{" and data[-1:] == "}":
+                try:
+                    data = json.loads(data)
+                except Exception:
+                    pass
             module = (row.get("Source Module") or row.get("module") or "").strip()
             ip = (row.get("IP Address") or "").strip()
             tags_raw = (row.get("Event Tags") or row.get("tags") or "").strip()
@@ -965,7 +1228,8 @@ def dedupe_events(events):
     same issue on different hosts stays separate. The most-severe copy of a
     duplicate is the one kept (so a low-severity twin can never swallow a
     critical), at the position of the first occurrence. Exact duplicates share
-    the same event id (type|data_str), so triage carries over regardless."""
+    the same event id (built from the same type+target+data key), so triage
+    carries over regardless."""
     seen = {}            # dedupe key -> index into out
     out = []
     for ev in events:
@@ -1177,7 +1441,9 @@ class Store:
                 self.data = {}
 
     def get(self, fid):
-        return self.data.get(fid, {"status": "new", "notes": "", "updated": ""})
+        rec = self.data.get(fid, {"status": "new", "notes": "", "updated": ""})
+        rec.setdefault("evidence", [])      # list of evidence image filenames
+        return rec
 
     def set(self, fid, status=None, notes=None, allowed=None):
         allowed = allowed if allowed is not None else STATUS_KEYS
@@ -1191,6 +1457,26 @@ class Store:
             self.data[fid] = cur
             self._flush()
             return cur
+
+    def add_evidence(self, fid, fname):
+        with self.lock:
+            cur = self.data.get(fid, {"status": "new", "notes": "", "updated": ""})
+            cur.setdefault("evidence", [])
+            if fname not in cur["evidence"]:
+                cur["evidence"].append(fname)
+            cur["updated"] = datetime.now().isoformat(timespec="seconds")
+            self.data[fid] = cur
+            self._flush()
+            return cur
+
+    def remove_evidence(self, fid, fname):
+        with self.lock:
+            cur = self.data.get(fid)
+            if cur and fname in cur.get("evidence", []):
+                cur["evidence"].remove(fname)
+                cur["updated"] = datetime.now().isoformat(timespec="seconds")
+                self._flush()
+            return cur or {"status": "new", "notes": "", "updated": "", "evidence": []}
 
     def _flush(self):
         tmp = self.path + ".tmp"
@@ -1292,6 +1578,470 @@ def build_json_export(events, store):
     return json.dumps(rows, indent=2, ensure_ascii=False)
 
 
+# severity / status vocabulary used by pentest reporting platforms
+REPORT_SEV = {"critical": "Critical", "high": "High", "medium": "Medium",
+              "low": "Low", "info": "Informational", "unknown": "Informational"}
+# triage states that mean the issue is still live (-> reported as Open)
+REPORT_OPEN_STATES = {"new", "triaging", "confirmed", "reported"}
+_REPORT_SEV_RANK = {"Critical": 5, "High": 4, "Medium": 3, "Low": 2, "Informational": 1}
+
+
+def build_report_json(events, store, src_name=""):
+    """Findings grouped one-per-issue for import into pentest reporting platforms
+    (AttackForge, PlexTrac, etc.). Each finding carries its affected assets (one
+    row per target, de-duplicated), remediation, references, evidence and tags,
+    using field names from the common reporting vocabulary so they map on import.
+    Scan-agnostic: everything comes from the parsed findings, not any fixed list."""
+    groups, order = {}, []
+    for ev in events:
+        if ev.get("lane") != "finding":
+            continue
+        st = store.get(ev["id"])
+        sev = REPORT_SEV.get(ev.get("priority"), "Informational")
+        key = (ev.get("title", ""), sev, ev.get("module", ""))
+        g = groups.get(key)
+        if g is None:
+            g = {
+                "title": ev.get("title") or ev.get("type") or "Finding",
+                "severity": sev,
+                "status": "Closed",                 # promoted to Open below if any asset is live
+                "description": ev.get("why") or "",
+                "evidence": ev.get("data_str") or "",
+                "recommendations": ev.get("remediation") or "",
+                "references": [],
+                "tags": [],
+                "source_tool": ("bbot:%s" % ev["module"]) if ev.get("module") else "bbot",
+                "affected_assets": [],
+                "_assets": set(), "_refs": set(), "_tags": set(),
+            }
+            groups[key] = g
+            order.append(key)
+        target = _target_of(ev)
+        if target and target not in g["_assets"]:
+            g["_assets"].add(target)
+            g["affected_assets"].append({
+                "asset": target,
+                "host": ev.get("dhost") or ev.get("host") or "",
+                "port": ev.get("port") or None,
+                "status": st.get("status", "new"),
+                "notes": st.get("notes", ""),
+                "evidence": ev.get("data_str") or "",
+                "evidence_screenshots": st.get("evidence", []),
+            })
+        for s in (ev.get("sources") or []):
+            if isinstance(s, (list, tuple)) and len(s) > 1 and s[1] and s[1] not in g["_refs"]:
+                g["_refs"].add(s[1])
+                g["references"].append({"title": s[0], "url": s[1]})
+        for tg in (ev.get("tags") or []):
+            if tg not in g["_tags"]:
+                g["_tags"].add(tg); g["tags"].append(tg)
+        if st.get("status", "new") in REPORT_OPEN_STATES:
+            g["status"] = "Open"
+    findings = []
+    for key in order:
+        g = groups[key]
+        for k in ("_assets", "_refs", "_tags"):
+            g.pop(k, None)
+        g["affected_asset_count"] = len(g["affected_assets"])
+        findings.append(g)
+    findings.sort(key=lambda f: (_REPORT_SEV_RANK.get(f["severity"], 0),
+                                 f["affected_asset_count"]), reverse=True)
+    payload = {
+        "tool": "bscope",
+        "format": "bscope-findings/1.0",
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "source": src_name,
+        "finding_count": len(findings),
+        "findings": findings,
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------- #
+#  Native scanner-import exports.
+#
+#  AttackForge and PlexTrac both import *scanner output in the tool's own
+#  format* - they do NOT read a bespoke "findings" schema. That is why the old
+#  fmt=report file imported nothing: it was bscope's own JSON, which neither
+#  platform has a parser for. Instead:
+#
+#   * AttackForge ships a native **Nuclei Scanner** parser. So we rebuild the
+#     findings as nuclei's own JSON (projectdiscovery `-json-export` shape) and
+#     the user imports it by choosing "Nuclei" on the Import Vulnerabilities
+#     screen. Real nuclei hits keep their true template id / name / severity /
+#     CVE-CWE classification; non-nuclei findings are expressed in the same
+#     schema with a derived template id so they import too.
+#   * PlexTrac has **no** nuclei parser, but it has a generic **Report Findings
+#     CSV template**. So for PlexTrac we emit that CSV exactly (its documented
+#     column order and vocabulary), grouped one row per issue.
+#
+#  Both are scan-agnostic: every value comes from the parsed findings.
+# --------------------------------------------------------------------------- #
+
+# triage states we never push into a report (the user dismissed them)
+_EXPORT_SKIP_STATES = {"false_positive"}
+
+
+def _slug(s):
+    s = re.sub(r"[^a-z0-9]+", "-", (s or "").lower()).strip("-")
+    return s or "finding"
+
+
+# --------------------------------------------------------------------------- #
+#  Generic, reusable vulnerability writeups.
+#
+#  For each finding we produce a client-agnostic writeup in three short sections
+#  - Description, Attack Scenario, Remediation Recommendations - written as a
+#  pentester would for a reusable report/writeup library. It is keyed off the
+#  vulnerability CLASS (the finding's title, which enrich() sets from RULES), so
+#  it contains NO host / URL / IP / client specifics and can be reused verbatim
+#  on future engagements. The specific location/evidence stays in the export's
+#  own asset/evidence fields, not in the writeup.
+# --------------------------------------------------------------------------- #
+
+# key (matches enrich() class title) -> (description, attack_scenario, remediation)
+GENERIC_WRITEUPS = {
+ "Host header injection": (
+  "The application uses the attacker-controllable HTTP Host header (or related headers such as X-Forwarded-Host) when building absolute URLs, links, or routing and caching decisions. Because this value can be set freely by the client, the application can be coerced into generating content that references an attacker-chosen domain.",
+  "An attacker sends requests with a crafted Host header to poison password-reset or email-verification links, cached responses, or redirects. A victim who follows the resulting link, or who is served a poisoned cache entry, is directed to attacker-controlled infrastructure, enabling credential theft, account takeover, or web cache poisoning that affects other users.",
+  "Do not derive absolute URLs or security decisions from the incoming Host header. Validate Host and X-Forwarded-Host against an allowlist of expected domains, set a canonical server name, and reject requests whose host does not match. Where links must be absolute, build them from server-side configuration rather than request headers."
+ ),
+ "Interesting / reflected parameter": (
+  "A request parameter is reflected into the application's response, or otherwise influences it, without sufficient validation or output encoding. Reflected, attacker-influenced input is a common entry point for client-side and server-side injection issues.",
+  "An attacker crafts a value for the parameter and delivers it to a victim or submits it directly. Depending on where the value is used, this can lead to cross-site scripting, open redirection, content spoofing, or further injection, potentially compromising user sessions or the integrity of the response.",
+  "Treat all request parameters as untrusted. Apply strict input validation, contextual output encoding, and allowlisting for values used in HTML, URLs, headers, or queries. Add a Content-Security-Policy as defense in depth and confirm the fix with targeted retesting."
+ ),
+ "Injection (SQLi / XSS / RCE / SSTI)": (
+  "User-supplied input is incorporated into an interpreter context - such as a database query, HTML response, operating-system command, or server-side template - without adequate separation of code and data. This class of flaw lets an attacker alter the intended logic of that context.",
+  "An attacker submits specially crafted input that breaks out of the data context and is executed as code. Impact ranges from reading or modifying database contents and hijacking user sessions to executing arbitrary commands on the server, and is frequently chained toward full compromise of the application or host.",
+  "Use parameterised queries or prepared statements for data access, contextual output encoding for rendered content, safe APIs instead of shell execution, and sandboxed or logic-less templating. Enforce strict input validation and least privilege for the application's service accounts, and retest to confirm the injection is no longer possible."
+ ),
+ "CORS misconfiguration": (
+  "The application returns permissive Cross-Origin Resource Sharing headers - for example reflecting arbitrary origins or allowing credentials with a wildcard - which relaxes the browser same-origin policy for its responses.",
+  "An attacker hosts a malicious page that makes authenticated cross-origin requests to the application on behalf of a logged-in victim and reads the responses. This can expose sensitive data or allow actions in the victim's context that the same-origin policy would normally prevent.",
+  "Restrict Access-Control-Allow-Origin to an explicit allowlist of trusted origins, never reflect the incoming Origin blindly, and only send Access-Control-Allow-Credentials with a specific origin (never with a wildcard). Return CORS headers only on endpoints that genuinely require cross-origin access."
+ ),
+ "Open redirect": (
+  "The application redirects users to a URL taken from attacker-controllable input without validating the destination against an allowlist of permitted targets.",
+  "An attacker crafts a link to the trusted application that redirects to an attacker-controlled site and distributes it in phishing. Because the link starts on a legitimate domain, victims are more likely to trust it, and the redirect can be used to steal credentials or OAuth tokens.",
+  "Avoid using user input to determine redirect destinations. Where redirection is required, map user input to a server-side allowlist of permitted URLs or use relative paths only, and reject or sanitise any absolute or externally-pointing destination."
+ ),
+ "SSRF": (
+  "The application fetches a resource from a URL that is influenced by user input, allowing an attacker to make the server issue requests to unintended destinations, including internal-only systems.",
+  "An attacker supplies a URL pointing at internal services, cloud metadata endpoints, or other back-end systems not reachable from the internet. The server makes the request on the attacker's behalf, which can disclose internal data, credentials, or cloud tokens and can be pivoted toward deeper access.",
+  "Validate and allowlist the hosts and schemes the application may request, resolve and verify destinations to block internal and link-local ranges, and disable unused URL schemes and redirects. Isolate outbound requests and remove or protect cloud metadata endpoints with defense-in-depth controls."
+ ),
+ "Default / weak credentials or exposed login": (
+  "An administrative or application login interface is exposed, and either accepts default/weak credentials or offers no protection against credential-guessing. Exposed management interfaces materially increase the attack surface.",
+  "An attacker discovers the login during reconnaissance and attempts default, weak, or previously-breached credentials, or brute-forces the interface. Successful authentication grants administrative or user access that can lead directly to data exposure or full compromise of the service.",
+  "Remove or restrict access to management interfaces (for example by network ACL or VPN), change all default credentials, enforce a strong password policy and multi-factor authentication, and add rate-limiting and account-lockout to resist guessing. Monitor authentication attempts for abuse."
+ ),
+ "Open cloud storage bucket": (
+  "A cloud storage container is configured to allow anonymous or overly-broad access to its contents or its listing. Misconfigured object storage is a frequent source of large-scale data exposure.",
+  "An attacker enumerates the storage container and reads or lists its objects without authentication, harvesting any sensitive files it holds. Where write access is also open, the attacker can tamper with or plant content that other users or systems will trust.",
+  "Set the storage container and its objects to private by default, remove public and authenticated-anyone grants, and enforce least-privilege access policies. Enable access logging and automated checks that flag any publicly-accessible storage."
+ ),
+ "Exposed .git directory": (
+  "A version-control directory (such as .git) is served by the web server, exposing repository metadata from which the application's source code and history can often be reconstructed.",
+  "An attacker downloads the exposed repository data and rebuilds the source code, revealing application logic, hardcoded secrets, and further vulnerabilities. Credentials or keys committed to history can then be used to access back-end systems.",
+  "Block web access to version-control directories at the server or reverse proxy, and remove them from the deployed web root entirely. Rotate any secrets that may have been exposed, and deploy from build artifacts rather than a working copy that contains repository metadata."
+ ),
+ "Leaked secret / credential": (
+  "A secret such as an API key, password, token, or private key is exposed where it can be retrieved by an unauthorised party. Exposed secrets provide a direct path to the systems they protect.",
+  "An attacker who recovers the secret uses it to authenticate to the associated service or data store, bypassing normal access controls. Depending on the secret's scope, this can grant access to sensitive data, cloud infrastructure, or third-party services.",
+  "Revoke and rotate the exposed secret immediately, and remove it from the exposed location and from any version-control history. Store secrets in a dedicated secrets manager, keep them out of source code and client-side assets, and add automated secret-scanning to prevent recurrence."
+ ),
+ "Exposed sensitive file": (
+  "A file that should not be publicly accessible - such as a configuration file, backup, archive, or environment file - is served by the application, disclosing its contents to anyone who requests it.",
+  "An attacker requests the file directly and reads its contents, which commonly include credentials, connection strings, internal paths, or other information that aids further attack. The disclosed material is often used to pivot toward authenticated access or deeper compromise.",
+  "Remove sensitive files from the web root and block access to backup, configuration, and environment file patterns at the server. Store configuration and secrets outside the served directory, and review the deployment process so such files are never published."
+ ),
+ "Known-CVE / outdated technology": (
+  "The service runs a software component whose version is affected by one or more publicly-documented vulnerabilities, or is end-of-life and no longer receiving security updates.",
+  "An attacker fingerprints the component and matches its version to public advisories and, frequently, ready-made exploits. Exploitation can range from information disclosure to remote code execution, depending on the specific issue, with little custom effort required.",
+  "Upgrade the affected component to a current, supported version that addresses the known issues, after confirming the deployed version really is in the vulnerable range. Establish a patch-management process and remove or replace end-of-life software that can no longer be updated."
+ ),
+ "Subdomain takeover": (
+  "A DNS record points at a third-party service or resource that is no longer claimed, allowing an attacker to register it and serve content from the organisation's subdomain.",
+  "An attacker claims the dangling resource and gains control of content served on the trusted subdomain. This can be used for convincing phishing, cookie or token theft within the parent domain, and bypass of controls that trust the organisation's own domains.",
+  "Remove DNS records that point at decommissioned or unclaimed services, and verify that every CNAME or alias resolves to a resource the organisation actually controls. Add periodic checks for dangling DNS entries as part of asset management."
+ ),
+ "GraphQL introspection enabled": (
+  "The GraphQL endpoint exposes its full schema through introspection, revealing all types, queries, and mutations the API supports.",
+  "An attacker queries introspection to map the entire API, including hidden or administrative operations, and uses that map to find and exploit weakly-protected fields or mutations far more efficiently than by guessing.",
+  "Disable introspection in production, enforce authentication and per-field authorisation on the API, and apply query depth and complexity limits. Expose introspection only in controlled non-production environments."
+ ),
+ "Telerik UI (deserialization / weak-key RCE)": (
+  "The application exposes Telerik UI components whose handlers are affected by well-documented vulnerabilities, including insecure deserialisation and weak or default cryptographic keys that can lead to remote code execution.",
+  "An attacker fingerprints the Telerik handlers and submits a crafted payload - for example forging an encrypted parameter using a known or weak key - to achieve file upload or deserialisation-based code execution on the server, often resulting in full host compromise.",
+  "Upgrade Telerik UI to a current patched release, replace any default or weak encryption keys with strong secret values, and disable or restrict unused handlers. Confirm the deployed version is not affected by the known deserialisation and key-based issues."
+ ),
+ "Vulnerable JavaScript library (retirejs)": (
+  "The page loads a client-side JavaScript library at a version with publicly-known vulnerabilities. The real severity depends on whether the vulnerable code path is actually reachable in the application.",
+  "An attacker who can influence input reaching the vulnerable library sink exploits the known flaw - commonly DOM-based cross-site scripting or prototype pollution - to run code in victims' browsers and compromise their sessions.",
+  "Upgrade the library to a fixed version, remove unused libraries, and verify no vulnerable sink is reachable from attacker-influenced input. Track third-party front-end dependencies and patch them as part of regular maintenance."
+ ),
+ "NTLM endpoint - internal name disclosure": (
+  "An endpoint supports NTLM authentication and, when probed, discloses internal information such as the host, domain, or DNS names of the environment.",
+  "An attacker queries the endpoint to harvest internal naming and domain details, which inform targeted password-spraying, phishing, and lateral-movement activity against the internal environment.",
+  "Restrict access to NTLM-authenticating endpoints to trusted networks, and avoid exposing them to the internet. Where external access is required, front them with controls that do not leak internal names and prefer modern authentication protocols."
+ ),
+ "403 / WAF bypass": (
+  "Access controls or a web application firewall that are intended to block certain requests can be circumvented through request manipulation, so protected content or functionality remains reachable.",
+  "An attacker varies request paths, methods, headers, or encodings until a blocked resource returns successfully, reaching content or functionality the control was meant to protect and undermining reliance on that control.",
+  "Enforce authorisation at the application layer rather than relying on perimeter filtering alone, and normalise requests before access decisions. Treat the WAF as defense in depth, and fix the underlying access-control gap so protected resources are not served regardless of the bypass technique."
+ ),
+ "WAF / CDN present": (
+  "A web application firewall or content delivery network sits in front of the asset. This is contextual information about the environment rather than a vulnerability in itself.",
+  "The presence of a WAF or CDN shapes how an attacker approaches the target - for example seeking the origin server to bypass protections - but does not by itself grant access. It is useful context when assessing other findings.",
+  "No direct remediation is required. Ensure the origin server is not directly reachable in a way that bypasses the WAF/CDN, and keep the protective service's rule sets current."
+ ),
+ "Email address exposed": (
+  "Employee or organisational email addresses are discoverable from public sources or the application, revealing valid address formats and potential targets.",
+  "An attacker uses the harvested addresses and the inferred naming convention to conduct phishing, password-spraying, and social-engineering campaigns against the organisation's users.",
+  "Minimise unnecessary public exposure of individual email addresses, prefer role-based or contact-form addresses where practical, and reinforce the controls that limit the impact of phishing and credential attacks, such as multi-factor authentication and user awareness training."
+ ),
+}
+
+# keyword -> GENERIC_WRITEUPS key, for findings whose title is scanner-specific
+# (e.g. nuclei template names) rather than one of the RULES class names.
+_GENERIC_KW = [
+ (("sql injection", "sqli", "xss", "cross-site scripting", "rce", "remote code",
+   "command injection", "template injection", "ssti", "deserial"), "Injection (SQLi / XSS / RCE / SSTI)"),
+ (("open redirect", "unvalidated redirect"), "Open redirect"),
+ (("ssrf", "server-side request forgery"), "SSRF"),
+ (("cors", "access-control-allow-origin", "cross-origin"), "CORS misconfiguration"),
+ (("host header", "x-forwarded-host"), "Host header injection"),
+ (("takeover", "dangling", "unclaimed"), "Subdomain takeover"),
+ (("introspection", "graphql"), "GraphQL introspection enabled"),
+ (("telerik",), "Telerik UI (deserialization / weak-key RCE)"),
+ ((".git", "git config", "git directory"), "Exposed .git directory"),
+ ((".env", "backup file", ".bak", "web.config", "config file", "appsettings"), "Exposed sensitive file"),
+ (("default credential", "default password", "weak password", "admin panel",
+   "login panel", "exposed panel", "exposed login"), "Default / weak credentials or exposed login"),
+ (("storage bucket", "s3 bucket", "blob container", "open bucket"), "Open cloud storage bucket"),
+ (("api key", "secret key", "private key", "token leak", "credential"), "Leaked secret / credential"),
+ (("cve-", "outdated", "end of life", "end-of-life", "deprecated version"), "Known-CVE / outdated technology"),
+]
+
+
+def generic_writeup(ev):
+    """Return {'description','attack_scenario','remediation'} - a generic,
+    client-agnostic three-section writeup for the finding's vulnerability class."""
+    title = (ev.get("title") or ev.get("type") or "Finding").strip()
+    wu = GENERIC_WRITEUPS.get(title)
+    if wu is None:
+        text = (ev.get("text") or "").lower()
+        for words, key in _GENERIC_KW:
+            if any(w in text for w in words) or any(w in title.lower() for w in words):
+                wu = GENERIC_WRITEUPS.get(key)
+                if wu:
+                    break
+    if wu is None:
+        name = title
+        wu = (
+            "%s is a security weakness identified during testing. Issues of this "
+            "class commonly stem from insecure configuration, missing hardening, or "
+            "outdated components, and expose information or functionality that was not "
+            "intended to be available to untrusted users." % name,
+            "An attacker performing reconnaissance against the target identifies this "
+            "condition and uses it to advance their objectives - gathering sensitive "
+            "information, expanding a foothold, or chaining it with other findings to "
+            "reach a greater impact such as unauthorised access or disruption of the service.",
+            "Remediate the underlying condition by applying vendor patches and secure-"
+            "configuration guidance for the affected component, removing or restricting any "
+            "data or functionality that does not need to be exposed, and validating the fix "
+            "through retesting. Apply defense-in-depth so a single misconfiguration does not "
+            "materially weaken the environment.",
+        )
+    return {"description": wu[0], "attack_scenario": wu[1], "remediation": wu[2]}
+
+
+def _writeup_text(ev):
+    """The three-section writeup as one plain-text block with headings - for a
+    single destination field such as a nuclei description or a report cell."""
+    wu = generic_writeup(ev)
+    return ("Description\n%s\n\nAttack Scenario\n%s\n\nRemediation Recommendations\n%s"
+            % (wu["description"], wu["attack_scenario"], wu["remediation"]))
+
+
+def _exact_asset(ev):
+    """The exact location a finding was observed at - the full URL when there is
+    one, else host:port, else the host. Deliberately avoids 'dhost' (the display
+    host, which back-fills a resolved/CDN/apex name for IP-only events): reports
+    must point at where the vuln actually is, not at a shared CDN root that would
+    collapse many distinct findings onto one asset."""
+    url = (ev.get("url") or "").strip()
+    if url:
+        return url
+    host = (ev.get("host") or ev.get("dhost") or "").strip()
+    port = ev.get("port")
+    if host and port:
+        return "%s:%s" % (host, port)
+    return host or (ev.get("data_str") or "").strip()[:200]
+
+
+def _finding_cves_cwes(ev):
+    blob = " ".join([ev.get("text", "") or "", ev.get("data_str", "") or "",
+                     ev.get("desc", "") or "", ev.get("why", "") or "",
+                     " ".join(map(str, ev.get("tags", []) or []))])
+    cves = list(dict.fromkeys(c.upper() for c in re.findall(r"CVE-\d{4}-\d{4,7}", blob, re.I)))
+    cwes = list(dict.fromkeys(("CWE-" + n) for n in re.findall(r"CWE-(\d{1,5})", blob, re.I)))
+    return cves, cwes
+
+
+def build_nuclei_export(events, store, src_name=""):
+    """Rebuild the findings as nuclei-native JSON so the file imports straight
+    into AttackForge via its native Nuclei Scanner parser. Output is a JSON
+    array, matching `nuclei -json-export <file>`."""
+    sevmap = {"critical": "critical", "high": "high", "medium": "medium",
+              "low": "low", "info": "info", "informational": "info", "unknown": "info"}
+    out = []
+    for ev in events:
+        if ev.get("lane") != "finding":
+            continue
+        st = store.get(ev["id"])
+        if st.get("status") in _EXPORT_SKIP_STATES:
+            continue
+        is_nuclei = _mod(ev, "nuclei")
+        tid = _nuclei_template_id(ev) if is_nuclei else ""
+        name = ((_nuclei_name(ev) if is_nuclei else "") or ev.get("title")
+                or ev.get("type") or "Finding")
+        if not tid:
+            tid = _slug(name)
+        sev = sevmap.get((ev.get("priority") or ev.get("severity") or "info").lower(), "info")
+        # Affected asset. matched-at/url carry the EXACT location (full URL with
+        # path); host carries a clean scheme://host origin. Real nuclei `host` is
+        # an origin, and AttackForge's Nuclei parser derives the affected asset
+        # from `host` - feeding it a full URL-with-path makes AF fail to parse it
+        # and fall back to the project's ROOT asset (the "www"/apex), which is the
+        # CDN-root bug the user hit. A clean origin here keeps the real (sub)domain
+        # and never the root; matched-at/url still show exactly where it was found.
+        asset = _exact_asset(ev)
+        u = (ev.get("url") or "").strip()
+        if u:
+            try:
+                pu = urllib.parse.urlsplit(u)
+                origin = ("%s://%s" % (pu.scheme, pu.netloc)) if (pu.scheme and pu.netloc) else asset
+            except Exception:
+                origin = asset
+        else:
+            origin = asset
+        host = origin
+        matched = asset
+        cves, cwes = _finding_cves_cwes(ev)
+        refs = [s[1] for s in (ev.get("sources") or [])
+                if isinstance(s, (list, tuple)) and len(s) > 1 and s[1]]
+        blob = (ev.get("data_str", "") or "") + " " + (ev.get("desc", "") or "")
+        mx = re.search(r"Extracted Data:\s*\[([^\]]*)\]", blob, re.I)
+        extracted = [x for x in re.split(r"\s*,\s*", mx.group(1).strip())
+                     if x] if (mx and mx.group(1).strip()) else []
+
+        # Generic, reusable 3-section writeup (Description / Attack Scenario /
+        # Remediation Recommendations) goes in the description field; the exact
+        # location/evidence stays in matched-at/url/extracted-results below.
+        desc = _writeup_text(ev)
+
+        info = {
+            "name": name,
+            "author": ["bbot"],
+            "tags": [str(t) for t in (ev.get("tags") or [])],
+            "description": desc,
+            "reference": refs,
+            "severity": sev,
+        }
+        classification = {}
+        if cves:
+            classification["cve-id"] = cves          # nuclei emits these uppercase
+        if cwes:
+            classification["cwe-id"] = cwes
+        if classification:
+            info["classification"] = classification
+
+        rec = {
+            "template-id": tid,
+            "template-url": ("https://github.com/projectdiscovery/nuclei-templates"
+                             if is_nuclei else ""),
+            "info": info,
+            "type": "http" if matched.startswith("http") else "network",
+            "host": host,
+            "matched-at": matched or host,
+            "url": matched or host,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        if extracted:
+            rec["extracted-results"] = extracted
+        out.append(rec)
+    return json.dumps(out, indent=2, ensure_ascii=False)
+
+
+_PLEXTRAC_SEV = {"critical": "Critical", "high": "High", "medium": "Medium",
+                 "low": "Low", "info": "Informational", "unknown": "Informational"}
+_PLEXTRAC_COLUMNS = ["title", "severity", "status", "description", "recommendations",
+                     "references", "affected_assets", "tags", "cvss_temporal",
+                     "cwe", "cve", "category", "category value"]
+
+
+def build_plextrac_csv(events, store, src_name=""):
+    """PlexTrac Report Findings CSV template. Documented column order and
+    vocabulary; one row per issue, assets/refs/tags/ids comma-joined in a
+    quoted cell. Required columns are title, severity, description."""
+    import io
+    groups, order = {}, []
+    for ev in events:
+        if ev.get("lane") != "finding":
+            continue
+        st = store.get(ev["id"])
+        if st.get("status") in _EXPORT_SKIP_STATES:
+            continue
+        sev = _PLEXTRAC_SEV.get((ev.get("priority") or "info").lower(), "Informational")
+        key = (ev.get("title", ""), sev, ev.get("module", ""))
+        g = groups.get(key)
+        if g is None:
+            wu = generic_writeup(ev)   # generic, reusable 3-section writeup
+            g = {"title": ev.get("title") or ev.get("type") or "Finding", "severity": sev,
+                 "status": "Closed",
+                 "description": ("Description\n%s\n\nAttack Scenario\n%s"
+                                 % (wu["description"], wu["attack_scenario"])),
+                 "recommendations": wu["remediation"],
+                 "_assets": [], "_aset": set(), "_refs": [], "_rset": set(),
+                 "_tags": [], "_tset": set(), "_cve": [], "_cwe": []}
+            groups[key] = g
+            order.append(key)
+        target = _exact_asset(ev)   # exact URL/location, never the CDN/display root
+        if target and target not in g["_aset"]:
+            g["_aset"].add(target); g["_assets"].append(target)
+        for s in (ev.get("sources") or []):
+            if isinstance(s, (list, tuple)) and len(s) > 1 and s[1] and s[1] not in g["_rset"]:
+                g["_rset"].add(s[1]); g["_refs"].append(s[1])
+        for tg in (ev.get("tags") or []):
+            tg = str(tg)
+            if tg not in g["_tset"]:
+                g["_tset"].add(tg); g["_tags"].append(tg)
+        cves, cwes = _finding_cves_cwes(ev)
+        for c in cves:
+            if c not in g["_cve"]:
+                g["_cve"].append(c)
+        for c in cwes:
+            if c not in g["_cwe"]:
+                g["_cwe"].append(c)
+        if st.get("status", "new") in REPORT_OPEN_STATES:
+            g["status"] = "Open"
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(_PLEXTRAC_COLUMNS)
+    order.sort(key=lambda k: _REPORT_SEV_RANK.get(groups[k]["severity"], 0), reverse=True)
+    for key in order:
+        g = groups[key]
+        w.writerow([
+            g["title"], g["severity"], g["status"], g["description"], g["recommendations"],
+            ", ".join(g["_refs"]), ", ".join(g["_assets"]), ", ".join(g["_tags"]),
+            "", ", ".join(g["_cwe"]), ", ".join(g["_cve"]), "", "",
+        ])
+    return buf.getvalue()
+
+
 def build_csv_export(events, store):
     import io
     buf = io.StringIO()
@@ -1305,6 +2055,347 @@ def build_csv_export(events, store):
                     ev["title"], _target_of(ev), ev["host"], ev["url"], ev["port"] or "",
                     ev["module"], " ".join(ev["tags"]), " ".join(ev["juicy"]),
                     st["status"], st["notes"], st["updated"]])
+    return buf.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+#  XLSX export (stdlib only: a styled .xlsx is a zip of XML parts). One sheet per
+#  recon tab, with a styled header, frozen top row, autofilter, tuned column
+#  widths, severity colour-coding and wrapped text.
+# --------------------------------------------------------------------------- #
+
+_XLSX_STYLES = (
+'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+'<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+'<fonts count="5">'
+'<font><sz val="11"/><color rgb="FF1A1A1A"/><name val="Calibri"/></font>'
+'<font><b/><sz val="11"/><color rgb="FF1A1A1A"/><name val="Calibri"/></font>'
+'<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>'
+'<font><b/><sz val="16"/><color rgb="FF1F2A37"/><name val="Calibri"/></font>'
+'<font><sz val="11"/><color rgb="FF6B7684"/><name val="Calibri"/></font>'
+'</fonts>'
+'<fills count="9">'
+'<fill><patternFill patternType="none"/></fill>'
+'<fill><patternFill patternType="gray125"/></fill>'
+'<fill><patternFill patternType="solid"><fgColor rgb="FF1F2A37"/></patternFill></fill>'
+'<fill><patternFill patternType="solid"><fgColor rgb="FFFF4D6D"/></patternFill></fill>'
+'<fill><patternFill patternType="solid"><fgColor rgb="FFFF7B3D"/></patternFill></fill>'
+'<fill><patternFill patternType="solid"><fgColor rgb="FFFFC93C"/></patternFill></fill>'
+'<fill><patternFill patternType="solid"><fgColor rgb="FF4A9EFF"/></patternFill></fill>'
+'<fill><patternFill patternType="solid"><fgColor rgb="FFE7ECF2"/></patternFill></fill>'
+'<fill><patternFill patternType="solid"><fgColor rgb="FFF3F6F9"/></patternFill></fill>'
+'</fills>'
+'<borders count="2">'
+'<border><left/><right/><top/><bottom/><diagonal/></border>'
+'<border><left style="thin"><color rgb="FFD0D7DE"/></left><right style="thin"><color rgb="FFD0D7DE"/></right>'
+'<top style="thin"><color rgb="FFD0D7DE"/></top><bottom style="thin"><color rgb="FFD0D7DE"/></bottom><diagonal/></border>'
+'</borders>'
+'<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+'<cellXfs count="12">'
+'<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+'<xf numFmtId="0" fontId="2" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center" wrapText="1"/></xf>'
+'<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>'
+'<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment vertical="top"/></xf>'
+'<xf numFmtId="0" fontId="2" fillId="3" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center"/></xf>'
+'<xf numFmtId="0" fontId="2" fillId="4" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center"/></xf>'
+'<xf numFmtId="0" fontId="1" fillId="5" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center"/></xf>'
+'<xf numFmtId="0" fontId="2" fillId="6" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center"/></xf>'
+'<xf numFmtId="0" fontId="0" fillId="7" borderId="1" xfId="0" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center"/></xf>'
+'<xf numFmtId="0" fontId="3" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+'<xf numFmtId="0" fontId="4" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+'<xf numFmtId="0" fontId="1" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment vertical="top"/></xf>'
+'</cellXfs>'
+'<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+'</styleSheet>')
+
+_XLSX_SEV_STYLE = {"critical": 4, "high": 5, "medium": 6, "low": 7, "info": 8, "unknown": 8}
+
+
+def _xl_col(n):
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _xl_text(v):
+    if v is None:
+        return ""
+    s = str(v)
+    s = "".join(c for c in s if c in "\t\n\r" or ord(c) >= 32)
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _xl_cell(col, row, value, style=0, numeric=False):
+    ref = "%s%d" % (_xl_col(col), row)
+    if numeric:
+        try:
+            if value in (None, "", 0):
+                return '<c r="%s" s="3"/>' % ref
+            return '<c r="%s" s="3"><v>%s</v></c>' % (ref, int(value))
+        except Exception:
+            pass
+    t = _xl_text(value)
+    if t == "":
+        return '<c r="%s" s="%d"/>' % (ref, style)
+    return ('<c r="%s" s="%d" t="inlineStr"><is><t xml:space="preserve">%s</t></is></c>'
+            % (ref, style, t))
+
+
+def _xl_sheet(cols, rows, autofilter=True, freeze=True):
+    """cols: list of {title, width, kind}. kind in text|num|sev|wrap|label."""
+    p = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">']
+    if freeze:
+        p.append('<sheetViews><sheetView workbookViewId="0">'
+                 '<pane ySplit="1" topLeftCell="A2" state="frozen" activePane="bottomLeft"/>'
+                 '<selection pane="bottomLeft"/></sheetView></sheetViews>')
+    p.append('<sheetFormatPr defaultRowHeight="15"/>')
+    p.append('<cols>')
+    for i, c in enumerate(cols, 1):
+        p.append('<col min="%d" max="%d" width="%d" customWidth="1"/>' % (i, i, c.get("width", 16)))
+    p.append('</cols><sheetData>')
+    p.append('<row r="1" ht="20" customHeight="1">')
+    for i, c in enumerate(cols, 1):
+        p.append(_xl_cell(i, 1, c["title"], style=1))
+    p.append('</row>')
+    r = 2
+    for row in rows:
+        p.append('<row r="%d">' % r)
+        for i, c in enumerate(cols, 1):
+            val = row[i - 1] if i - 1 < len(row) else ""
+            kind = c.get("kind", "text")
+            if kind == "num":
+                p.append(_xl_cell(i, r, val, numeric=True))
+            elif kind == "sev":
+                p.append(_xl_cell(i, r, str(val or "").title(),
+                                  style=_XLSX_SEV_STYLE.get(str(val or "").lower(), 8)))
+            elif kind == "wrap":
+                p.append(_xl_cell(i, r, val, style=2))
+            elif kind == "label":
+                p.append(_xl_cell(i, r, val, style=11))
+            else:
+                p.append(_xl_cell(i, r, val, style=3))
+        p.append('</row>')
+        r += 1
+    p.append('</sheetData>')
+    if autofilter and rows:
+        p.append('<autoFilter ref="A1:%s%d"/>' % (_xl_col(len(cols)), len(rows) + 1))
+    p.append('</worksheet>')
+    return "".join(p)
+
+
+def _refs_text(ev):
+    out = []
+    for s in (ev.get("sources") or []):
+        if isinstance(s, (list, tuple)) and len(s) > 1:
+            out.append("%s: %s" % (s[0], s[1]))
+    return "\n".join(out)
+
+
+def _cmds_text(ev):
+    out = []
+    for c in (ev.get("commands") or []):
+        if not (isinstance(c, (list, tuple)) and len(c) > 1):
+            continue
+        kind = c[2] if len(c) > 2 else "shell"
+        tag = " [browser console]" if kind == "console" else (" [manual]" if kind == "manual" else "")
+        out.append("# %s%s\n%s" % (c[0], tag, c[1]))
+    return "\n".join(out)
+
+
+def build_xlsx(events, findings, assets, store, shots, src_name=""):
+    """A styled multi-sheet workbook mirroring the recon tabs. Stdlib only."""
+    sheets = []                       # (name, xml)
+
+    # ---- Overview ----
+    sev_ct = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+    for e in findings:
+        k = e.get("priority")
+        if k in sev_ct:
+            sev_ct[k] += 1
+    stat_ct = {}
+    for e in findings:
+        s = store.get(e["id"])["status"]
+        stat_ct[s] = stat_ct.get(s, 0) + 1
+    tcount = {}
+    for e in events:
+        tcount[e["type"]] = tcount.get(e["type"], 0) + 1
+    mcount = {}
+    for e in events:
+        if e.get("module"):
+            mcount[e["module"]] = mcount.get(e["module"], 0) + 1
+    ov = [["Scan source", src_name],
+          ["Generated", datetime.now().isoformat(timespec="seconds")],
+          ["Total events", str(len(events))],
+          ["Findings", str(len(findings))],
+          ["Assets", str(len(assets))],
+          ["Screenshots", str(len(shots or []))],
+          ["", ""],
+          ["Critical findings", str(sev_ct["critical"])],
+          ["High findings", str(sev_ct["high"])],
+          ["Medium findings", str(sev_ct["medium"])],
+          ["Low findings", str(sev_ct["low"])],
+          ["Info findings", str(sev_ct["info"])],
+          ["", ""]]
+    for s in STATUSES:
+        if stat_ct.get(s["key"]):
+            ov.append(["Triage - " + s["label"], str(stat_ct[s["key"]])])
+    ov.append(["", ""])
+    ov.append(["Event types", "\n".join("%s: %d" % (t, n)
+               for t, n in sorted(tcount.items(), key=lambda x: -x[1]))])
+    ov.append(["Top modules", "\n".join("%s: %d" % (t, n)
+               for t, n in sorted(mcount.items(), key=lambda x: -x[1])[:20])])
+    sheets.append(("Overview", _xl_sheet(
+        [{"title": "Metric", "width": 26, "kind": "label"},
+         {"title": "Value", "width": 80, "kind": "wrap"}], ov, autofilter=False)))
+
+    # ---- Findings ----
+    if findings:
+        cols = [{"title": "Severity", "width": 12, "kind": "sev"},
+                {"title": "Title", "width": 40, "kind": "wrap"},
+                {"title": "Target", "width": 42, "kind": "wrap"},
+                {"title": "Host", "width": 24}, {"title": "Port", "width": 7, "kind": "num"},
+                {"title": "Module", "width": 16}, {"title": "Status", "width": 15},
+                {"title": "Notes", "width": 28, "kind": "wrap"},
+                {"title": "Tags", "width": 28, "kind": "wrap"},
+                {"title": "Description", "width": 55, "kind": "wrap"},
+                {"title": "Evidence", "width": 55, "kind": "wrap"},
+                {"title": "Remediation", "width": 55, "kind": "wrap"},
+                {"title": "References", "width": 45, "kind": "wrap"},
+                {"title": "Commands", "width": 55, "kind": "wrap"},
+                {"title": "Evidence screenshots", "width": 32, "kind": "wrap"}]
+        rows = []
+        for e in findings:
+            st = store.get(e["id"])
+            rows.append([e.get("priority", ""), e.get("title", ""), _target_of(e),
+                         e.get("dhost") or e.get("host", ""), e.get("port") or "",
+                         e.get("module", ""), st["status"], st.get("notes", ""),
+                         ", ".join(e.get("tags", [])), e.get("why", ""),
+                         e.get("data_str", ""), e.get("remediation", ""),
+                         _refs_text(e), _cmds_text(e), "\n".join(st.get("evidence", []))])
+        sheets.append(("Findings", _xl_sheet(cols, rows)))
+
+    # ---- Assets ----
+    if assets:
+        cols = [{"title": "Type", "width": 18}, {"title": "Target", "width": 46, "kind": "wrap"},
+                {"title": "Host", "width": 26}, {"title": "Port", "width": 7, "kind": "num"},
+                {"title": "Module", "width": 18}, {"title": "Tags", "width": 40, "kind": "wrap"},
+                {"title": "Juicy", "width": 20, "kind": "wrap"}]
+        rows = [[e.get("type", ""), _target_of(e), e.get("dhost") or e.get("host", ""),
+                 e.get("port") or "", e.get("module", ""), ", ".join(e.get("tags", [])),
+                 ", ".join(e.get("juicy", []))] for e in assets]
+        sheets.append(("Assets", _xl_sheet(cols, rows)))
+
+    # ---- Hosts (pivot) ----
+    hosts = {}
+    for e in events:
+        h = (e.get("dhost") or e.get("host") or "")
+        if not h:
+            continue
+        s = hosts.setdefault(h, {"f": 0, "p": 0, "u": 0, "t": 0, "sev": 0, "juicy": set()})
+        for j in e.get("juicy", []):
+            s["juicy"].add(j)
+        if e.get("lane") == "finding":
+            s["f"] += 1
+            s["sev"] = max(s["sev"], SEV_RANK.get(e.get("priority"), 0))
+        elif e.get("type") == "OPEN_TCP_PORT":
+            s["p"] += 1
+        elif e.get("type") in ("URL", "URL_UNVERIFIED", "URL_HINT"):
+            s["u"] += 1
+        elif e.get("type") == "TECHNOLOGY":
+            s["t"] += 1
+    if hosts:
+        rank_name = {5: "critical", 4: "high", 3: "medium", 2: "low", 1: "info", 0: ""}
+        cols = [{"title": "Host", "width": 36}, {"title": "Top severity", "width": 13, "kind": "sev"},
+                {"title": "Findings", "width": 10, "kind": "num"},
+                {"title": "Open ports", "width": 11, "kind": "num"},
+                {"title": "URLs", "width": 9, "kind": "num"}, {"title": "Tech", "width": 9, "kind": "num"},
+                {"title": "Juicy tags", "width": 34, "kind": "wrap"}]
+        rows = []
+        for h, s in sorted(hosts.items(), key=lambda kv: (-kv[1]["sev"], -kv[1]["f"], kv[0])):
+            rows.append([h, rank_name.get(s["sev"], ""), s["f"], s["p"], s["u"], s["t"],
+                         ", ".join(sorted(s["juicy"]))])
+        sheets.append(("Hosts", _xl_sheet(cols, rows)))
+
+    # ---- URLs (deduped) ----
+    seen, urows = set(), []
+    for e in findings + assets:
+        u = e.get("url") or ""
+        if not u and e.get("type") in ("URL", "URL_UNVERIFIED", "URL_HINT"):
+            d = (e.get("data_str") or "").split()
+            if d and d[0].lower().startswith("http"):
+                u = d[0]
+        if u and u not in seen:
+            seen.add(u)
+            urows.append([u, e.get("type", ""), ", ".join(e.get("tags", []))])
+    if urows:
+        urows.sort(key=lambda r: r[0])
+        cols = [{"title": "URL", "width": 72, "kind": "wrap"}, {"title": "Type", "width": 16},
+                {"title": "Tags", "width": 40, "kind": "wrap"}]
+        sheets.append(("URLs", _xl_sheet(cols, urows)))
+
+    # ---- Emails ----
+    emails = collect_emails(events)
+    if emails:
+        cols = [{"title": "Email", "width": 42}, {"title": "Domain", "width": 30}]
+        rows = [[em, em.split("@")[1] if "@" in em else ""] for em in emails]
+        sheets.append(("Emails", _xl_sheet(cols, rows)))
+
+    # ---- Screenshots (metadata; images are in the live dashboard) ----
+    if shots:
+        cols = [{"title": "File", "width": 42}, {"title": "Label / URL", "width": 50, "kind": "wrap"},
+                {"title": "Host", "width": 28}, {"title": "Status", "width": 14},
+                {"title": "Size (bytes)", "width": 13, "kind": "num"}]
+        rows = []
+        for it in shots:
+            stt = store.get("shot:" + it.get("rel", ""))["status"]
+            rows.append([it.get("file", ""), it.get("label", ""),
+                         (it.get("label", "") or "").replace("http://", "").replace("https://", "").split("/")[0].split(":")[0],
+                         stt, it.get("size") or ""])
+        sheets.append(("Screenshots", _xl_sheet(cols, rows)))
+
+    # ---- assemble the package ----
+    ct = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+          '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+          '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+          '<Default Extension="xml" ContentType="application/xml"/>'
+          '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+          '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>']
+    for i in range(1, len(sheets) + 1):
+        ct.append('<Override PartName="/xl/worksheets/sheet%d.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' % i)
+    ct.append('</Types>')
+
+    wb = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+          '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+          'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>']
+    for i, (name, _xml) in enumerate(sheets, 1):
+        wb.append('<sheet name="%s" sheetId="%d" r:id="rId%d"/>' % (_xl_text(name)[:31], i, i))
+    wb.append('</sheets></workbook>')
+
+    rels = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">']
+    for i in range(1, len(sheets) + 1):
+        rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet%d.xml"/>' % (i, i))
+    rels.append('<Relationship Id="rId%d" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>' % (len(sheets) + 1))
+    rels.append('</Relationships>')
+
+    root_rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                 '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                 '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+                 '</Relationships>')
+
+    buf = io.BytesIO()
+    z = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+    z.writestr("[Content_Types].xml", "".join(ct))
+    z.writestr("_rels/.rels", root_rels)
+    z.writestr("xl/workbook.xml", "".join(wb))
+    z.writestr("xl/_rels/workbook.xml.rels", "".join(rels))
+    z.writestr("xl/styles.xml", _XLSX_STYLES)
+    for i, (name, xml) in enumerate(sheets, 1):
+        z.writestr("xl/worksheets/sheet%d.xml" % i, xml)
+    z.close()
     return buf.getvalue()
 
 
@@ -1345,7 +2436,7 @@ padding:5px 11px;cursor:pointer;font-size:12px;user-select:none;}
 .muted{color:var(--muted);}
 /* findings */
 .card{background:var(--panel);border:1px solid var(--line);border-left-width:4px;border-radius:10px;
-padding:12px 14px;margin-bottom:10px;}
+padding:12px 14px;margin-bottom:10px;content-visibility:auto;contain-intrinsic-size:auto 120px;}
 .card.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent2);}
 .card h3{margin:0 0 3px;font-size:15px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
 .sevtag{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;
@@ -1357,6 +2448,24 @@ cursor:pointer;word-break:break-all;}
 .detail{margin:7px 0;padding:7px 9px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;font-size:12.5px;color:var(--text);word-break:break-word;white-space:pre-wrap;}
 .detail .lbl{color:var(--muted);font-weight:600;margin-right:6px;}
 .why{margin:7px 0;color:var(--text);}
+.remed{margin-top:8px;}
+.remed>summary{cursor:pointer;color:#38c172;font-weight:600;font-size:12.5px;}
+.remed .why{margin:6px 0 4px;}
+.sources{font-size:12px;color:var(--muted);margin:4px 0 2px;word-break:break-word;}
+.sources .lbl{color:var(--muted);font-weight:600;margin-right:4px;}
+.sources a{color:var(--accent2);text-decoration:none;}
+.sources a:hover{text-decoration:underline;}
+.sources .sep{color:var(--line);}
+.evidence{margin-top:8px;border-top:1px dashed var(--line);padding-top:8px;}
+.evlbl{font-size:12px;font-weight:600;color:#a66bff;margin-bottom:5px;}
+.evrow{display:flex;flex-wrap:wrap;gap:8px;}
+.evrow:empty{display:none;}
+.evthumb{position:relative;display:inline-block;margin-bottom:6px;}
+.evthumb img{height:88px;max-width:160px;object-fit:cover;border:1px solid var(--line);border-radius:6px;cursor:zoom-in;display:block;}
+.evdel{position:absolute;top:-7px;right:-7px;background:#ff4d6d;color:#fff;border:1px solid var(--bg);border-radius:50%;width:19px;height:19px;font-size:13px;line-height:1;cursor:pointer;padding:0;}
+.evpaste{border:1px dashed var(--line);border-radius:6px;padding:9px 11px;font-size:12px;color:var(--muted);cursor:text;outline:none;background:var(--panel2);}
+.evpaste:focus{border-color:var(--accent2);color:var(--text);background:var(--panel);}
+.evfile{color:var(--accent2);cursor:pointer;text-decoration:underline;}
 .sub{font-size:12px;color:var(--muted);}
 details{margin-top:8px;}
 summary{cursor:pointer;color:var(--muted);font-size:13px;}
@@ -1364,6 +2473,11 @@ summary{cursor:pointer;color:var(--muted);font-size:13px;}
 .cmd{display:flex;align-items:center;gap:8px;margin:4px 0;}
 .cmd code{flex:1;background:#0a0e15;border:1px solid var(--line);border-radius:6px;padding:5px 8px;
 font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;overflow-x:auto;white-space:pre;}
+.cmdblock{margin:6px 0;}
+.cmdlbl{font-size:11px;color:var(--muted);margin:0 0 2px 2px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+.cmdtag{font-size:9px;font-weight:700;letter-spacing:.3px;text-transform:uppercase;padding:1px 6px;border-radius:9px;}
+.ck-console{background:#1d3a5f;color:#8ec7ff;border:1px solid #2d5a8f;}
+.ck-manual{background:#3a2f1d;color:#ffce8e;border:1px solid #6b4f2d;}
 .copy{background:var(--panel2);border:1px solid var(--line);color:var(--muted);border-radius:6px;
 padding:3px 8px;font-size:11px;cursor:pointer;}
 .statusrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;align-items:center;}
@@ -1388,9 +2502,16 @@ table{width:100%;border-collapse:collapse;font-size:13px;}
 th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);vertical-align:top;}
 th{color:var(--muted);font-weight:600;position:sticky;top:57px;background:var(--bg);}
 td.mono{font-family:ui-monospace,Menlo,Consolas,monospace;word-break:break-all;}
+/* urls */
+.urlbox{width:100%;min-height:440px;background:#0a0e15;border:1px solid var(--line);border-radius:8px;
+color:var(--text);padding:9px 11px;font:12px/1.55 ui-monospace,Menlo,Consolas,monospace;resize:vertical;
+outline:none;white-space:pre;overflow:auto;}
+.urlbox:focus{border-color:var(--accent2);}
+.hint{font-size:12px;color:var(--muted);margin:0 0 10px;}
+.hint code{background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:0 5px;font-size:11px;}
 /* screenshots */
 .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));}
-.shot{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;transition:border-color .12s;}
+.shot{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;transition:border-color .12s;content-visibility:auto;contain-intrinsic-size:auto 250px;}
 .shot .thumb{cursor:pointer;}
 .shotbtns{display:flex;gap:6px;margin-top:8px;}
 .techrow{display:flex;flex-wrap:wrap;gap:4px;margin-top:7px;}
@@ -1434,7 +2555,7 @@ padding:6px;display:none;flex-direction:column;gap:4px;z-index:30;min-width:150p
 .exmenu a{color:var(--text);text-decoration:none;padding:6px 10px;border-radius:6px;font-size:13px;}
 .exmenu a:hover{background:var(--panel2);}
 /* host pivot */
-.host{background:var(--panel);border:1px solid var(--line);border-left-width:4px;border-radius:10px;margin-bottom:10px;overflow:hidden;}
+.host{background:var(--panel);border:1px solid var(--line);border-left-width:4px;border-radius:10px;margin-bottom:10px;overflow:hidden;content-visibility:auto;contain-intrinsic-size:auto 90px;}
 .host>summary{list-style:none;cursor:pointer;padding:11px 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
 .host>summary::-webkit-details-marker{display:none;}
 /* rotating disclosure caret so host / section rows read as expandable */
@@ -1476,6 +2597,7 @@ summary:hover>.caret{color:var(--accent);}
     <button class="tab" data-tab="findings">Findings</button>
     <button class="tab" data-tab="assets">Assets</button>
     <button class="tab" data-tab="emails">Emails</button>
+    <button class="tab" data-tab="urls">URLs</button>
     <button class="tab" data-tab="shots">Screenshots</button>
     <button class="tab" data-tab="meta">Metadata</button>
   </div>
@@ -1486,6 +2608,9 @@ summary:hover>.caret{color:var(--accent);}
       <a href="/api/export?fmt=md" target="_blank">Report (Markdown)</a>
       <a href="/api/export?fmt=csv" target="_blank">All events (CSV)</a>
       <a href="/api/export?fmt=json" target="_blank">All events (JSON)</a>
+      <a href="/api/export?fmt=attackforge" download="bscope-nuclei.json">AttackForge (Nuclei JSON)</a>
+      <a href="/api/export?fmt=plextrac" download="bscope-plextrac.csv">PlexTrac (Findings CSV)</a>
+      <a href="/api/export?fmt=xlsx">Workbook (XLSX)</a>
       <a href="/api/export?fmt=emails" target="_blank">Emails (.txt)</a>
     </div>
   </div>
@@ -1496,6 +2621,7 @@ summary:hover>.caret{color:var(--accent);}
   <section id="view-findings" style="display:none"></section>
   <section id="view-assets" style="display:none"></section>
   <section id="view-emails" style="display:none"></section>
+  <section id="view-urls" style="display:none"></section>
   <section id="view-shots" style="display:none"></section>
   <section id="view-meta" style="display:none"></section>
 </main>
@@ -1599,7 +2725,7 @@ function renderOverview(){
 
   const top=(obj,n)=>Object.entries(obj).sort((a,b)=>b[1]-a[1]).slice(0,n);
   h+='<div class="tiles" style="margin-top:18px"><div class="tile"><div class="l">Event types</div>';
-  top(typeCount,10).forEach(([k,v])=>h+=`<div class="sub">${esc(k)} <span class="muted">x${v}</span></div>`);
+  top(typeCount,99).forEach(([k,v])=>h+=`<div class="sub">${esc(k)} <span class="muted">x${v}</span></div>`);
   h+='</div><div class="tile"><div class="l">Top modules</div>';
   top(modCount,10).forEach(([k,v])=>h+=`<div class="sub">${esc(k)} <span class="muted">x${v}</span></div>`);
   h+='</div></div>';
@@ -1663,7 +2789,7 @@ function renderHosts(){
     h+=`<span class="hmeta">${s.findings.length} findings &middot; ${s.ports.length} ports &middot; ${s.urls.length} urls &middot; ${s.tech.length} tech</span></summary>`;
     h+='<div class="body" style="overflow:hidden">';
     const hc=hostCommands(s);HOSTCMDS[s.host]=hc;
-    if(s.shot)h+=`<img class="hthumb" style="float:right;margin:0 0 8px 10px" src="${s.shot.src}" onclick="${hx('openImg('+JSON.stringify(s.shot.src)+','+JSON.stringify(s.host)+')')}">`;
+    if(s.shot)h+=`<img class="hthumb" loading="lazy" decoding="async" style="float:right;margin:0 0 8px 10px" src="${s.shot.src}" onclick="${hx('openImg('+JSON.stringify(s.shot.src)+','+JSON.stringify(s.host)+')')}">`;
     if(s.findings.length){h+='<div class="sec"><h4>Findings</h4>';
       s.findings.sort((a,b)=>(SEVR[b.priority]||0)-(SEVR[a.priority]||0)).forEach(ev=>{
         const st=SMAP[ev.triage.status]||STATUSES[0];
@@ -1690,19 +2816,28 @@ function renderHosts(){
 }
 function jumpHost(host){document.getElementById('search').value=host;show('findings');}
 
-/* aggregate a deduped, ordered recon command set for one host */
+/* A concise, bounded recon command set for one host: one service scan, then
+   web recon against each DISTINCT web root (scheme://host:port) seen on the
+   host - not one command per finding/URL, which previously produced hundreds.
+   Per-finding verification commands still live on each finding card. */
+const HOST_CMD_ROOT_LIMIT=8;
 function hostCommands(s){
   const out=[],seen=new Set();
   const add=(label,cmd)=>{if(cmd&&!seen.has(cmd)){seen.add(cmd);out.push([label,cmd]);}};
-  // one consolidated service scan across every open port, else a top-ports sweep
   const ports=[...new Set(s.ports.map(p=>p.port).filter(Boolean))].sort((a,b)=>a-b);
   if(ports.length)add('Service scan (all ports)','nmap -sCV -p'+ports.join(',')+' '+s.host);
   else add('Port scan','nmap -sCV --top-ports 1000 '+s.host);
-  // pull every event's web/recon commands, minus per-port nmap and repeated screenshots
-  [...s.findings,...s.urls,...s.other,...s.tech,...s.ports].forEach(ev=>(ev.commands||[]).forEach(c=>{
-    if(/^nmap /.test(c[1])||/^gowitness /.test(c[1]))return;
-    add(c[0],c[1]);
-  }));
+  // distinct web roots on this host, from its urls/findings
+  const roots=[];const rseen=new Set();
+  [...s.urls,...s.findings,...s.tech].forEach(ev=>{const u=ev.url||ev.data_str||'';
+    try{const p=new URL(u);const r=p.protocol+'//'+p.host;if(!rseen.has(r)){rseen.add(r);roots.push(r);}}catch(e){}});
+  roots.slice(0,HOST_CMD_ROOT_LIMIT).forEach(r=>{
+    add('Headers',"curl -sSIk '"+r+"'");
+    add('Fingerprint',"httpx -u '"+r+"' -sc -title -tech-detect -server");
+    add('Nuclei',"nuclei -u '"+r+"'");
+    add('Content discovery',"ffuf -u '"+r+"/FUZZ' -w /usr/share/seclists/Discovery/Web-Content/common.txt");
+  });
+  if(roots.length>HOST_CMD_ROOT_LIMIT)add('More web roots',"# "+(roots.length-HOST_CMD_ROOT_LIMIT)+" more web root(s) on this host - see the URLs tab");
   add('Screenshot','gowitness single https://'+s.host);
   return out;
 }
@@ -1727,12 +2862,77 @@ function reportedHTML(ev){
   if(d===ev.why||d===ev.title)return '';
   return `<div class="detail"><span class="lbl">Reported</span>${esc(d)}</div>`;
 }
+function remediationHTML(ev){
+  if(ev.lane!=='finding'||!ev.remediation)return '';
+  let h=`<details class="remed" open><summary>Remediation</summary><div class="why">${esc(ev.remediation)}</div>`;
+  if(ev.sources&&ev.sources.length){
+    h+='<div class="sources"><span class="lbl">Sources:</span> ';
+    h+=ev.sources.map(x=>`<a href="${esc(x[1])}" target="_blank" rel="noopener noreferrer">${esc(x[0])}</a>`).join('<span class="sep"> &middot; </span>');
+    h+='</div>';}
+  h+='</details>';return h;}
+function evImgs(ev){
+  const list=(ev.triage&&ev.triage.evidence)||[];
+  if(!list.length)return '';
+  return list.map(n=>{const src='/evidence/'+encodeURIComponent(n);
+    return `<span class="evthumb"><img loading="lazy" decoding="async" src="${src}" title="click to enlarge" onclick="${hx('openImg('+JSON.stringify(src)+','+JSON.stringify('Evidence: '+(ev.title||''))+')')}">`
+      +`<button class="evdel" title="remove evidence" onclick="${hx('event.stopPropagation();removeEvidence('+JSON.stringify(ev.id)+','+JSON.stringify(n)+')')}">&times;</button></span>`;}).join('');
+}
+function evidenceHTML(ev){
+  if(ev.lane!=='finding')return '';
+  return `<div class="evidence" id="ev-${ev.id}">`
+    +`<div class="evlbl">&#128247; Evidence${(ev.triage&&ev.triage.evidence&&ev.triage.evidence.length)?(' ('+ev.triage.evidence.length+')'):''}</div>`
+    +`<div class="evrow">${evImgs(ev)}</div>`
+    +`<div class="evpaste" tabindex="0" onpaste="onEvPaste(event,'${ev.id}')" onclick="this.focus()">`
+    +`Click here, then press Ctrl+V / &#8984;V to paste a screenshot as evidence`
+    +` &middot; <label class="evfile" onclick="event.stopPropagation()">choose file<input type="file" accept="image/*" style="display:none" onchange="onEvFile(this,'${ev.id}')"></label>`
+    +`</div></div>`;
+}
+function setEvidence(id,list){
+  const ev=DATA.findings.find(f=>f.id===id);
+  if(ev){ev.triage=ev.triage||{};ev.triage.evidence=list||[];}
+  const box=document.getElementById('ev-'+id);
+  if(box&&ev){const row=box.querySelector('.evrow');if(row)row.innerHTML=evImgs(ev);
+    const lbl=box.querySelector('.evlbl');if(lbl)lbl.innerHTML='&#128247; Evidence'+(ev.triage.evidence.length?(' ('+ev.triage.evidence.length+')'):'');}
+}
+function uploadEvidence(id,dataURL){
+  toast('uploading evidence…');
+  fetch('/api/evidence',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,data:dataURL})})
+    .then(r=>r.ok?r.json():r.text().then(t=>Promise.reject(t||('HTTP '+r.status))))
+    .then(d=>{setEvidence(id,d.evidence);toast('evidence added');})
+    .catch(e=>toast('upload failed: '+e));
+}
+function removeEvidence(id,name){
+  fetch('/api/evidence_delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,name:name})})
+    .then(r=>r.json()).then(d=>{setEvidence(id,d.evidence);toast('evidence removed');})
+    .catch(()=>toast('remove failed'));
+}
+function fileToEvidence(id,file){
+  if(!file||!/^image\//.test(file.type||''))return toast('not an image');
+  if(file.size>12*1024*1024)return toast('image too large (max 12MB)');
+  const fr=new FileReader();fr.onload=()=>uploadEvidence(id,fr.result);
+  fr.onerror=()=>toast('could not read image');fr.readAsDataURL(file);
+}
+function onEvPaste(e,id){
+  const items=(e.clipboardData&&e.clipboardData.items)||[];
+  for(let i=0;i<items.length;i++){const it=items[i];
+    if(it.type&&it.type.indexOf('image')===0){e.preventDefault();const f=it.getAsFile();if(f)fileToEvidence(id,f);return;}}
+  toast('no image on the clipboard - copy a screenshot first');
+}
+function onEvFile(input,id){if(input.files&&input.files[0])fileToEvidence(id,input.files[0]);input.value='';}
+function cmdHTML(c){
+  const kind=(c&&c[2])||'shell';
+  const badge=kind==='console'?'<span class="cmdtag ck-console">browser console</span>'
+            :(kind==='manual'?'<span class="cmdtag ck-manual">manual</span>':'');
+  const lbl=c[0]?`<div class="cmdlbl">${esc(c[0])}${badge}</div>`:'';
+  return `<div class="cmdblock">${lbl}<div class="cmd"><code>${esc(c[1])}</code>`
+    +`<button class="copy" onclick="${hx('copy('+JSON.stringify(c[1])+')')}">copy</button></div></div>`;
+}
 function playbookHTML(ev){let h='';
   if(ev.playbook&&ev.playbook.length){
     h+=`<details open><summary>What a tester can do</summary><ul class="play">`;
     ev.playbook.forEach(p=>h+=`<li>${esc(p)}</li>`);h+=`</ul>`;
     if(ev.commands&&ev.commands.length){h+='<div style="margin-top:6px">';
-      ev.commands.forEach(c=>h+=`<div class="cmd"><code>${esc(c[1])}</code><button class="copy" onclick="${hx('copy('+JSON.stringify(c[1])+')')}">copy</button></div>`);
+      ev.commands.forEach(c=>h+=cmdHTML(c));
       h+='</div>';}
     h+=`</details>`;}
   return h;}
@@ -1741,7 +2941,7 @@ function cardHTML(ev,idx){
   const tgt=ev.url||(ev.port?`${H(ev)}:${ev.port}`:H(ev))||ev.data_str.slice(0,90);
   const thumb=thumbFor(ev);
   let h=`<div class="card ${idx===selIdx?'sel':''}" style="border-left-color:${sc}" id="card-${ev.id}" data-eid="${ev.id}" data-idx="${idx}">`;
-  if(thumb)h+=`<img class="cardthumb" src="${thumb.src}" onclick="${hx('event.stopPropagation();openImg('+JSON.stringify(thumb.src)+','+JSON.stringify(tgt)+')')}">`;
+  if(thumb)h+=`<img class="cardthumb" loading="lazy" decoding="async" src="${thumb.src}" onclick="${hx('event.stopPropagation();openImg('+JSON.stringify(thumb.src)+','+JSON.stringify(tgt)+')')}">`;
   h+=`<h3><span class="sevtag" style="background:${sc}">${ev.priority}</span>${esc(ev.title)}
       <span class="statustag" style="background:${st.color}">${st.label}</span></h3>`;
   h+=`<div>${badges(ev)}</div>`;
@@ -1750,6 +2950,8 @@ function cardHTML(ev,idx){
   if(ev.why)h+=`<div class="why">${esc(ev.why)}</div>`;
   h+=reportedHTML(ev);
   h+=playbookHTML(ev);
+  h+=remediationHTML(ev);
+  h+=evidenceHTML(ev);
   h+=`<div class="statusrow">${statusButtons(ev,false)}</div>`;
   h+=`<textarea class="notes" placeholder="tester notes (autosaves)..." oninput="noteInput('${ev.id}',this.value)" onblur="saveNotes('${ev.id}',this.value)">${esc(ev.triage.notes||'')}</textarea>`;
   h+=`</div>`;return h;
@@ -1759,10 +2961,14 @@ function groupHTML(sig,items){
   const anyNew=COMPARE&&items.some(i=>i.is_new);
   const juicy=new Set();items.forEach(i=>(i.juicy||[]).forEach(j=>juicy.add(j)));
   // status breakdown across the group, in workflow order
-  const cnt={};items.forEach(ev=>{const k=ev.triage.status||'new';cnt[k]=(cnt[k]||0)+1;});
+  // one row per affected target: collapse repeated URLs/targets inside the group
+  const tgtOf=ev=>ev.url||(ev.port?`${H(ev)}:${ev.port}`:H(ev))||ev.data_str||'';
+  const _seenT=new Set(),uniq=[];
+  items.forEach(ev=>{const tg=tgtOf(ev);if(!_seenT.has(tg)){_seenT.add(tg);uniq.push(ev);}});
+  const cnt={};uniq.forEach(ev=>{const k=ev.triage.status||'new';cnt[k]=(cnt[k]||0)+1;});
   let h=`<div class="card" style="border-left-color:${sc}">`;
   h+=`<h3><span class="sevtag" style="background:${sc}">${rep.priority}</span>${esc(rep.title)}
-      <span class="muted">x${items.length}</span></h3>`;
+      <span class="muted">x${uniq.length}</span></h3>`;
   let b='';if(anyNew)b+='<span class="newbadge">NEW</span> ';
   [...juicy].forEach(j=>b+=`<span class="juicytag">&#9733; ${esc(j)}</span> `);
   if(b)h+=`<div>${b}</div>`;
@@ -1770,13 +2976,14 @@ function groupHTML(sig,items){
   if(rep.why)h+=`<div class="why">${esc(rep.why)}</div>`;
   h+=reportedHTML(rep);
   h+=playbookHTML(rep);
+  h+=remediationHTML(rep);
   // --- affected targets: compact, scannable, paginated, drill-down per row ---
   const expanded=expandedGroups.has(sig);
-  const shown=expanded?items:items.slice(0,GROUP_LIMIT);
+  const shown=expanded?uniq:uniq.slice(0,GROUP_LIMIT);
   let sum='';STATUSES.forEach(s=>{if(cnt[s.key])sum+=`<span class="gsum"><span class="sev-dot" style="background:${s.color}"></span><b>${cnt[s.key]}</b> ${esc(s.label.toLowerCase())}</span>&nbsp; `;});
-  h+=`<div class="sec" style="margin-top:8px"><h4 style="margin:0 0 4px;font-size:12px;color:var(--muted)">Affected targets (${items.length})</h4>`;
+  h+=`<div class="sec" style="margin-top:8px"><h4 style="margin:0 0 4px;font-size:12px;color:var(--muted)">Affected targets (${uniq.length})</h4>`;
   if(sum)h+=`<div style="margin:2px 0 6px">${sum}</div>`;
-  shown.forEach(ev=>{const tgt=ev.url||(ev.port?`${H(ev)}:${ev.port}`:H(ev))||ev.data_str.slice(0,120);
+  shown.forEach(ev=>{const tgt=tgtOf(ev).slice(0,200);
     const st=SMAP[ev.triage.status]||STATUSES[0];
     h+=`<div class="inst" data-eid="${ev.id}">
       <span class="sdot" style="background:${st.color}" title="${esc(st.label)}"></span>
@@ -1785,10 +2992,43 @@ function groupHTML(sig,items){
       <details class="rowtri"><summary>triage</summary>
         <div class="statusrow">${statusButtons(ev,true)}</div>
         <input class="notes" style="min-height:28px;width:100%" placeholder="notes..." value="${esc(ev.triage.notes||'')}" oninput="noteInput('${ev.id}',this.value)" onblur="saveNotes('${ev.id}',this.value)">
+        ${evidenceHTML(ev)}
       </details></div>`;});
-  if(!expanded&&items.length>GROUP_LIMIT)
-    h+=`<button class="gmore" onclick="${hx('expandGroup('+JSON.stringify(sig)+')')}">show all ${items.length} targets</button>`;
+  if(!expanded&&uniq.length>GROUP_LIMIT)
+    h+=`<button class="gmore" onclick="${hx('expandGroup('+JSON.stringify(sig)+')')}">show all ${uniq.length} targets</button>`;
   h+='</div></div>';return h;
+}
+/* ---------------- incremental (windowed) rendering ----------------
+   Large scans have thousands of findings/assets. Building every card in one
+   innerHTML string is what makes the tab feel slow. Instead we render a small
+   first chunk and append more as a sentinel scrolls into view, so the DOM stays
+   small and the tab is interactive immediately. */
+const CHUNK=60;
+let _chunkIO=null, _findLoader=null;
+function chunkRender(appendTarget, sentinelHost, items, itemHTML){
+  if(_chunkIO){try{_chunkIO.disconnect();}catch(e){}_chunkIO=null;}
+  let i=0;
+  const sent=document.createElement('div');sent.style.height='1px';
+  sentinelHost.appendChild(sent);
+  function more(){
+    const end=Math.min(i+CHUNK,items.length);let h='';
+    for(;i<end;i++)h+=itemHTML(items[i],i);
+    if(h)appendTarget.insertAdjacentHTML('beforeend',h);
+    if(i>=items.length){try{io.disconnect();}catch(e){}if(sent.parentNode)sent.remove();}
+  }
+  const io=new IntersectionObserver(es=>{if(es.some(e=>e.isIntersecting))more();},{rootMargin:'1200px'});
+  _chunkIO=io;io.observe(sent);
+  more();                                   // first chunk, synchronously
+  return function ensure(idx){while(i<=idx&&i<items.length)more();};
+}
+/* move the keyboard selection without rebuilding the whole list */
+function moveSel(d){
+  const list=window._flist||[];if(!list.length)return;
+  selIdx=Math.max(0,Math.min(selIdx+d,list.length-1));
+  if(_findLoader)_findLoader(selIdx);       // page in the target card if needed
+  document.querySelectorAll('.card.sel').forEach(c=>c.classList.remove('sel'));
+  const el=document.querySelector('.card[data-idx="'+selIdx+'"]');
+  if(el){el.classList.add('sel');el.scrollIntoView({block:'nearest'});}
 }
 function renderFindings(){
   flushNotes();                 // persist any in-progress notes before rebuilding the DOM
@@ -1806,23 +3046,28 @@ function renderFindings(){
   h+=`<span class="chip ${groupSimilar?'on':''}" style="${groupSimilar?'background:#4a9eff':''}" onclick="toggleGroup()">group similar</span>`;
   h+=`<span class="muted">${list.length} shown</span></div>`;
 
-  if(!list.length){h+='<div class="empty">No findings match the current filters.</div>';
-    document.getElementById('view-findings').innerHTML=h;window._flist=[];return;}
+  const view=document.getElementById('view-findings');
+  if(!list.length){view.innerHTML=h+'<div class="empty">No findings match the current filters.</div>';
+    window._flist=[];_findLoader=null;return;}
 
+  view.innerHTML=h+'<div id="flist"></div>';
+  const flist=document.getElementById('flist');
   if(groupSimilar){
     const groups={};list.forEach(ev=>{const sig=ev.title+'|'+ev.priority+'|'+ev.module;(groups[sig]=groups[sig]||[]).push(ev);});
-    Object.entries(groups).sort((a,b)=>(SEVR[b[1][0].priority]||0)-(SEVR[a[1][0].priority]||0)||b[1].length-a[1].length)
-      .forEach(([sig,items])=>h+=groupHTML(sig,items));
-    window._flist=[];
+    const entries=Object.entries(groups).sort((a,b)=>(SEVR[b[1][0].priority]||0)-(SEVR[a[1][0].priority]||0)||b[1].length-a[1].length);
+    window._flist=[];_findLoader=null;
+    chunkRender(flist,view,entries,e=>groupHTML(e[0],e[1]));
   }else{
-    list.forEach((ev,i)=>h+=cardHTML(ev,i));window._flist=list;
+    window._flist=list;
+    _findLoader=chunkRender(flist,view,list,(ev,i)=>cardHTML(ev,i));
   }
-  document.getElementById('view-findings').innerHTML=h;
 }
 
 /* ---------------- ASSETS ---------------- */
+let ASSETMAP={};   // id -> asset for the currently-rendered rows (detail built lazily)
 function renderAssets(){
   flushNotes();
+  ASSETMAP={};
   let rows=DATA.assets.filter(matchQ).filter(ev=>!typeFilter||ev.type===typeFilter);
   if(juicyOnly)rows=rows.filter(ev=>ev.juicy&&ev.juicy.length);
   if(newOnly)rows=rows.filter(ev=>ev.is_new);
@@ -1836,20 +3081,74 @@ function renderAssets(){
   if(COMPARE)h+=`<span class="chip ${newOnly?'on':''}" style="${newOnly?'background:#38c172':''}" onclick="toggleNew()">new only</span>`;
   h+=`<span class="muted">${rows.length} shown</span></div>`;
   h+='<p class="muted" style="margin:-4px 0 10px">Click a row for the tester playbook.</p>';
-  h+='<table><thead><tr><th></th><th>Type</th><th>Target</th><th>Module</th><th>Tags</th></tr></thead><tbody>';
-  rows.forEach(ev=>{const tgt=ev.url||(ev.port?`${H(ev)}:${ev.port}`:H(ev))||ev.data_str;
+  h+='<table><thead><tr><th></th><th>Type</th><th>Target</th><th>Module</th><th>Tags</th></tr></thead><tbody id="atbody"></tbody></table>';
+  const view=document.getElementById('view-assets');
+  view.innerHTML=h;
+  const tb=document.getElementById('atbody');
+  chunkRender(tb,view,rows,ev=>{ASSETMAP[ev.id]=ev;
+    const tgt=ev.url||(ev.port?`${H(ev)}:${ev.port}`:H(ev))||ev.data_str;
     const star=(ev.juicy&&ev.juicy.length)?'<span class="star" title="'+esc(ev.juicy.join(', '))+'">&#9733;</span>':'';
     const nb=(COMPARE&&ev.is_new)?' <span class="newbadge">NEW</span>':'';
-    h+=`<tr style="cursor:pointer" onclick="toggleAsset('${ev.id}')"><td>${star}</td><td>${esc(ev.type)}</td>
-      <td class="mono">${esc(tgt)}${nb}</td><td class="muted">${esc(ev.module||'-')}</td><td class="muted">${esc(ev.tags.join(', '))}</td></tr>`;
-    let d=`<tr id="ax-${ev.id}" style="display:none"><td></td><td colspan="4" style="background:var(--panel)">`;
-    if(ev.why)d+=`<div class="why">${esc(ev.why)}</div>`;
-    d+=`<div class="tgt" onclick="${hx('copy('+JSON.stringify(tgt)+')')}" title="copy target">${esc(tgt)} &#128203;</div>`;
-    if(ev.playbook&&ev.playbook.length){d+='<ul class="play">';ev.playbook.forEach(p=>d+=`<li>${esc(p)}</li>`);d+='</ul>';}
-    if(ev.commands&&ev.commands.length)ev.commands.forEach(c=>d+=`<div class="cmd"><code>${esc(c[1])}</code><button class="copy" onclick="${hx('copy('+JSON.stringify(c[1])+')')}">copy</button></div>`);
-    d+='</td></tr>';h+=d;});
-  h+='</tbody></table>';
-  document.getElementById('view-assets').innerHTML=h;
+    // detail cell is left empty and filled on first expand (keeps big asset lists fast)
+    return `<tr style="cursor:pointer" onclick="toggleAsset('${ev.id}')"><td>${star}</td><td>${esc(ev.type)}</td>`
+      +`<td class="mono">${esc(tgt)}${nb}</td><td class="muted">${esc(ev.module||'-')}</td><td class="muted">${esc(ev.tags.join(', '))}</td></tr>`
+      +`<tr id="ax-${ev.id}" style="display:none"><td></td><td colspan="4" class="axbody" style="background:var(--panel)"></td></tr>`;});
+}
+
+/* ---------------- URLS ----------------
+   one deduped, copy-ready list of every URL BBOT touched, for pasting into
+   feroxbuster/ffuf (--stdin / -u) or Burp's Target > Scope. */
+let urlMode='full', urlVerified=false, urlScope=false, urlStatus='', URLLIST=[];
+const URL_MODES=[['full','Full URLs','every URL, as found'],
+                 ['base','Base URLs','scheme://host:port only - feroxbuster/ffuf targets'],
+                 ['host','Hostnames','host only - Burp scope / resolvers']];
+function urlOf(ev){
+  if(ev.url)return ev.url;
+  if(ev.type==='URL'||ev.type==='URL_UNVERIFIED'){const d=(ev.data_str||'').split(/\s/)[0];if(/^https?:\/\//i.test(d))return d;}
+  return '';
+}
+function urlEvents(){return [...DATA.findings,...DATA.assets].filter(ev=>urlOf(ev));}
+function urlShape(u){try{const p=new URL(u);
+    return urlMode==='base'?p.protocol+'//'+p.host:urlMode==='host'?p.hostname:u;}catch(e){return urlMode==='full'?u:'';}}
+function setUrlMode(m){urlMode=m;renderUrls();}
+function toggleUrlVerified(){urlVerified=!urlVerified;renderUrls();}
+function toggleUrlScope(){urlScope=!urlScope;renderUrls();}
+function setUrlStatus(c){urlStatus=(urlStatus===c?'':c);renderUrls();}
+function copyUrls(){const txt=URLLIST.join('\n');if(!txt)return toast('nothing to copy');
+  const done=()=>toast('copied '+URLLIST.length+' lines');
+  const fallback=()=>{const ta=document.getElementById('urlbox');if(!ta)return toast('copy failed');
+    ta.focus();ta.select();try{document.execCommand('copy')?done():toast('copy failed');}catch(e){toast('copy failed');}};
+  if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(txt).then(done,fallback);else fallback();}
+function downloadUrls(){const txt=URLLIST.join('\n');if(!txt)return toast('nothing to download');
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([txt+'\n'],{type:'text/plain'}));
+  a.download='bscope-'+urlMode+'.txt';document.body.appendChild(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(a.href),2000);}
+function renderUrls(){
+  flushNotes();
+  const all=urlEvents();
+  const codes={};let anyScope=false,anyUnv=false;
+  all.forEach(ev=>{(ev.tags||[]).forEach(t=>{const m=/^status-(\d{3})$/.exec(t);if(m)codes[m[1]]=(codes[m[1]]||0)+1;
+    if(t==='in-scope')anyScope=true;});if(ev.type==='URL_UNVERIFIED'||ev.type==='URL_HINT')anyUnv=true;});
+  let evs=all.filter(matchQ);
+  if(urlVerified)evs=evs.filter(ev=>ev.type!=='URL_UNVERIFIED'&&ev.type!=='URL_HINT');
+  if(urlScope)evs=evs.filter(ev=>(ev.tags||[]).includes('in-scope'));
+  if(urlStatus)evs=evs.filter(ev=>(ev.tags||[]).includes('status-'+urlStatus));
+  const seen=new Set();URLLIST=[];
+  evs.forEach(ev=>{const v=urlShape(urlOf(ev));if(v&&!seen.has(v)){seen.add(v);URLLIST.push(v);}});
+  URLLIST.sort();
+  let h='<div class="bar">';
+  URL_MODES.forEach(([k,l,t])=>h+=`<span class="chip ${urlMode===k?'on':''}" style="${urlMode===k?'background:var(--accent)':''}" title="${esc(t)}" onclick="setUrlMode('${k}')">${esc(l)}</span>`);
+  h+='</div><div class="bar">';
+  if(anyUnv)h+=`<span class="chip ${urlVerified?'on':''}" style="${urlVerified?'background:#38c172':''}" title="drop URL_UNVERIFIED (seen in a page/JS but never requested)" onclick="toggleUrlVerified()">verified only</span>`;
+  if(anyScope)h+=`<span class="chip ${urlScope?'on':''}" style="${urlScope?'background:#38c172':''}" title="only events BBOT tagged in-scope" onclick="toggleUrlScope()">in-scope only</span>`;
+  Object.keys(codes).sort().forEach(c=>h+=`<span class="chip ${urlStatus===c?'on':''}" style="${urlStatus===c?'background:#ffc93c':''}" onclick="setUrlStatus('${c}')">${c} <span class="muted">${codes[c]}</span></span>`);
+  h+='</div><div class="bar">';
+  h+=`<button class="btn" onclick="copyUrls()">&#128203; Copy all</button>`;
+  h+=`<button class="btn" onclick="downloadUrls()">&#8681; Download .txt</button>`;
+  h+=`<span class="muted">${URLLIST.length} unique &middot; ${evs.length} events &middot; search box filters this list</span></div>`;
+  h+='<p class="hint">Paste into <code>feroxbuster --stdin</code> / <code>ffuf -u</code> (use Base URLs), or Burp &rarr; Target &rarr; Scope &rarr; Include (paste Hostnames or Base URLs). Ctrl-A in the box selects everything.</p>';
+  h+=`<textarea class="urlbox" id="urlbox" readonly spellcheck="false">${esc(URLLIST.join('\n'))}</textarea>`;
+  document.getElementById('view-urls').innerHTML=h;
 }
 
 /* ---------------- SCREENSHOTS ---------------- */
@@ -1877,23 +3176,23 @@ function renderShots(){
   h+=`<span class="muted">${shotView.length} shown</span></div>`;
   if(!Object.keys(TECHMAP).length&&!SHOTS.some(it=>it.gwtech&&it.gwtech.length))
     h+='<p class="muted" style="margin:-4px 0 10px">No tech data &mdash; run bbot with the <span class="kbd">wappalyzer</span> module, or pass <span class="kbd">--gowitness-db</span> for per-URL tech stacks.</p>';
-  if(!shotView.length){h+='<div class="empty">No screenshots matched.</div>';document.getElementById('view-shots').innerHTML=h;return;}
-  h+='<div class="grid">';
-  shotView.forEach((it,i)=>{const st=SHOTSMAP[it.status||'new']||SHOTST[0];
+  const vEl=document.getElementById('view-shots');
+  if(!shotView.length){h+='<div class="empty">No screenshots matched.</div>';vEl.innerHTML=h;return;}
+  vEl.innerHTML=h+'<div class="grid" id="shotgrid"></div>';
+  chunkRender(document.getElementById('shotgrid'),vEl,shotView,(it,i)=>{
+    const st=SHOTSMAP[it.status||'new']||SHOTST[0];
     const acc=(it.status&&it.status!=='new')?st.color:'var(--line)';
     const u=/^https?:\/\//i.test(it.label||'')?it.label:'';
     const head=u
       ? `<a class="shoturl" href="${esc(u)}" target="_blank" rel="noopener noreferrer" title="Open ${esc(u)} in a new tab" onclick="event.stopPropagation()">${esc(it.label)} <span class="ext">&#8599;</span></a>`
       : `<div class="shoturl nolink" title="${esc(it.label)}">${esc(it.label)}</div>`;
-    h+=`<div class="shot" style="border-color:${acc}">
+    return `<div class="shot" style="border-color:${acc}">
       ${head}
-      <div class="thumb" onclick="openLb(${i})"><img loading="lazy" src="${it.src}"></div>
+      <div class="thumb" onclick="openLb(${i})"><img loading="lazy" decoding="async" src="${it.src}"></div>
       <div class="m">
       <div class="sub">${esc(it.file)}${it.size?(' &middot; '+fmt(it.size)):''}</div>
       ${techChips(shotTechs(it))}
       <div class="shotbtns">${shotButtons(it)}</div></div></div>`;});
-  h+='</div>';
-  document.getElementById('view-shots').innerHTML=h;
 }
 function setShotFilter(k){shotFilter=k;renderShots();}
 function setShotStatus(rel,status){
@@ -1989,7 +3288,18 @@ function findEv(id){return DATA.findings.find(e=>e.id===id)||DATA.assets.find(e=
 function toggleSev(s){sevFilter.has(s)?sevFilter.delete(s):sevFilter.add(s);renderFindings();}
 function toggleStatus(s){statusFilter.has(s)?statusFilter.delete(s):statusFilter.add(s);renderFindings();}
 function setType(t){typeFilter=t;renderAssets();}
-function toggleAsset(id){const r=document.getElementById('ax-'+id);if(r)r.style.display=(r.style.display==='none'?'':'none');}
+function assetDetailHTML(ev){
+  const tgt=ev.url||(ev.port?`${H(ev)}:${ev.port}`:H(ev))||ev.data_str;
+  let d='';
+  if(ev.why)d+=`<div class="why">${esc(ev.why)}</div>`;
+  d+=`<div class="tgt" onclick="${hx('copy('+JSON.stringify(tgt)+')')}" title="copy target">${esc(tgt)} &#128203;</div>`;
+  if(ev.playbook&&ev.playbook.length){d+='<ul class="play">';ev.playbook.forEach(p=>d+=`<li>${esc(p)}</li>`);d+='</ul>';}
+  if(ev.commands&&ev.commands.length)ev.commands.forEach(c=>d+=cmdHTML(c));
+  return d;}
+function toggleAsset(id){const r=document.getElementById('ax-'+id);if(!r)return;
+  const cell=r.querySelector('.axbody');
+  if(cell&&!cell.dataset.built&&ASSETMAP[id]){cell.innerHTML=assetDetailHTML(ASSETMAP[id]);cell.dataset.built='1';}
+  r.style.display=(r.style.display==='none'?'':'none');}
 function toggleJuicy(){juicyOnly=!juicyOnly;rerender();}
 function toggleNew(){newOnly=!newOnly;rerender();}
 function toggleGroup(){groupSimilar=!groupSimilar;selIdx=-1;renderFindings();}
@@ -2015,16 +3325,14 @@ function renderMeta(){
   h+='</div>';
   h+='<p class="muted" style="margin:-4px 0 10px">Every field BBOT captured for each event, after dedupe. Click a row to expand the full raw record.</p>';
   if(!list.length){h+='<div class="empty">No events matched.</div>';el.innerHTML=h;return;}
-  h+='<table><thead><tr><th>Type</th><th>Target</th><th>Module</th><th>Tags</th></tr></thead><tbody>';
-  list.forEach((m,i)=>{
-    h+=`<tr style="cursor:pointer" onclick="toggleMeta(${i})"><td>${esc(m.type)}</td>`
-      +`<td class="mono">${esc(m.target||'')}</td><td class="muted">${esc(m.module||'-')}</td>`
-      +`<td class="muted">${esc((m.tags||[]).join(', '))}</td></tr>`;
-    h+=`<tr id="mx-${i}" style="display:none"><td colspan="4" style="background:var(--panel)">`
-      +`<pre class="rawjson">${esc(JSON.stringify(m.raw,null,2))}</pre></td></tr>`;
-  });
-  h+='</tbody></table>';
+  h+='<table><thead><tr><th>Type</th><th>Target</th><th>Module</th><th>Tags</th></tr></thead><tbody id="mtbody"></tbody></table>';
   el.innerHTML=h;
+  chunkRender(document.getElementById('mtbody'),el,list,(m,i)=>
+    `<tr style="cursor:pointer" onclick="toggleMeta(${i})"><td>${esc(m.type)}</td>`
+      +`<td class="mono">${esc(m.target||'')}</td><td class="muted">${esc(m.module||'-')}</td>`
+      +`<td class="muted">${esc((m.tags||[]).join(', '))}</td></tr>`
+      +`<tr id="mx-${i}" style="display:none"><td colspan="4" style="background:var(--panel)">`
+      +`<pre class="rawjson">${esc(JSON.stringify(m.raw,null,2))}</pre></td></tr>`);
 }
 
 /* ---------------- EMAILS ---------------- */
@@ -2084,15 +3392,39 @@ function renderEmails(){
   document.getElementById('view-emails').innerHTML=h;
 }
 
-function rerender(){if(TAB==='findings')renderFindings();else if(TAB==='assets')renderAssets();else if(TAB==='hosts')renderHosts();else if(TAB==='emails')renderEmails();else if(TAB==='shots')renderShots();else if(TAB==='meta')renderMeta();}
+function rerender(){if(TAB==='findings')renderFindings();else if(TAB==='assets')renderAssets();else if(TAB==='hosts')renderHosts();else if(TAB==='emails')renderEmails();else if(TAB==='urls')renderUrls();else if(TAB==='shots')renderShots();else if(TAB==='meta')renderMeta();}
 
-function show(tab){TAB=tab;selIdx=-1;
+/* only surface a tab when the scan actually produced that kind of data, so an
+   empty Emails / URLs / Screenshots / Findings / Assets tab is never shown. */
+function tabHasData(tab){
+  switch(tab){
+    case 'overview': return true;
+    case 'hosts':    return [...DATA.findings,...DATA.assets].some(ev=>H(ev));
+    case 'findings': return DATA.findings.length>0;
+    case 'assets':   return DATA.assets.length>0;
+    case 'emails':   return (DATA.emails||[]).length>0;
+    case 'urls':     return urlEvents().length>0;
+    case 'shots':    return SHOTS.length>0;
+    case 'meta':     return (DATA.findings.length+DATA.assets.length)>0;
+    default:         return true;
+  }
+}
+function applyTabVisibility(){
+  document.querySelectorAll('.tab').forEach(b=>{
+    b.style.display = tabHasData(b.dataset.tab) ? '' : 'none';});
+  const em=document.querySelector('#exMenu a[href*="fmt=emails"]');
+  if(em) em.style.display = (DATA.emails||[]).length ? '' : 'none';
+}
+function show(tab){selIdx=-1;
+  if(!tabHasData(tab))tab='overview';
+  TAB=tab;
   document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));
-  ['overview','hosts','findings','assets','emails','shots','meta'].forEach(t=>
+  ['overview','hosts','findings','assets','emails','urls','shots','meta'].forEach(t=>
     document.getElementById('view-'+t).style.display=(t===tab?'':'none'));
   if(tab==='overview')renderOverview();else if(tab==='hosts')renderHosts();
   else if(tab==='findings')renderFindings();else if(tab==='assets')renderAssets();
   else if(tab==='emails')renderEmails();
+  else if(tab==='urls')renderUrls();
   else if(tab==='shots')renderShots();
   else if(tab==='meta')renderMeta();
 }
@@ -2125,8 +3457,8 @@ document.addEventListener('keydown',e=>{
   if(e.key==='/'){e.preventDefault();document.getElementById('search').focus();return;}
   if(TAB!=='findings'||groupSimilar)return;
   const list=window._flist||[];
-  if(e.key==='j'){selIdx=Math.min(selIdx+1,list.length-1);renderFindings();scrollSel();}
-  else if(e.key==='k'){selIdx=Math.max(selIdx-1,0);renderFindings();scrollSel();}
+  if(e.key==='j'){moveSel(1);}
+  else if(e.key==='k'){moveSel(-1);}
   else if(/^[1-7]$/.test(e.key)&&selIdx>=0&&list[selIdx]){const s=STATUSES[parseInt(e.key)-1];if(s)setStatus(list[selIdx].id,s.key);}
 });
 function scrollSel(){const el=document.querySelector('.card.sel');if(el)el.scrollIntoView({block:'nearest'});}
@@ -2139,6 +3471,7 @@ Promise.all([
   DATA=d;DATA.removed=d.removed||[];DATA.emails=d.emails||[];
   SHOTS=shots.map(it=>({...it,status:it.status||'new',src:'/img/'+it.rel.split('/').map(encodeURIComponent).join('/')}));
   SHOTMAP={};SHOTS.forEach(it=>{const h=shotHostOf(it);if(h&&!SHOTMAP[h])SHOTMAP[h]=it;});
+  applyTabVisibility();
   TECHMAP={};[...DATA.findings,...DATA.assets].forEach(ev=>{
     if(ev.tech&&H(ev)){const h=H(ev).toLowerCase();(TECHMAP[h]=TECHMAP[h]||[]);
       if(!TECHMAP[h].includes(ev.tech))TECHMAP[h].push(ev.tech);}});
@@ -2155,6 +3488,7 @@ class Handler(BaseHTTPRequestHandler):
     store = None
     shots = []
     shots_root = ""
+    evidence_dir = ""
     gw_by_file = {}           # gowitness: screenshot basename -> [tech]
     gw_by_url = {}            # gowitness: url -> [tech]
     prev_ids = set()          # ids present in the --compare scan (diff mode)
@@ -2167,10 +3501,24 @@ class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="text/html; charset=utf-8", extra=None):
         if isinstance(body, str):
             body = body.encode("utf-8")
+        headers = dict(extra or {})
+        # gzip text/JSON payloads when the client accepts it and it's worth it.
+        # Big wins on the one-shot /api/findings + /api/raw loads and the page
+        # itself; binary (images, xlsx) is left untouched.
+        if (self.command != "HEAD" and len(body) > 900
+                and "gzip" in (self.headers.get("Accept-Encoding", "") or "").lower()
+                and any(t in ctype for t in ("text/", "json", "javascript", "csv", "xml", "svg"))
+                and "Content-Encoding" not in headers):
+            try:
+                body = gzip.compress(body, 5)
+                headers["Content-Encoding"] = "gzip"
+                headers["Vary"] = "Accept-Encoding"
+            except Exception:
+                pass
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        for k, v in (extra or {}).items():
+        for k, v in headers.items():
             self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
@@ -2180,7 +3528,8 @@ class Handler(BaseHTTPRequestHandler):
     def _client_event(self, ev):
         d = {k: ev[k] for k in ("id", "type", "module", "tags", "data_str", "host",
                                 "dhost", "url", "port", "scheme", "priority", "title", "why",
-                                "playbook", "commands", "text", "lane", "juicy", "tech")}
+                                "playbook", "commands", "text", "lane", "juicy", "tech",
+                                "remediation", "sources")}
         d["triage"] = self.store.get(ev["id"])
         d["is_new"] = self.compare_active and ev["id"] not in self.prev_ids
         return d
@@ -2223,6 +3572,27 @@ class Handler(BaseHTTPRequestHandler):
                 body = build_json_export(self.events, self.store)
                 return self._send(200, body, ctype="application/json; charset=utf-8",
                                   extra={"Content-Disposition": "attachment; filename=bscope-export.json"})
+            if fmt in ("attackforge", "nuclei", "af"):
+                body = build_nuclei_export(self.events, self.store,
+                                           getattr(self, "src_name", ""))
+                return self._send(200, body, ctype="application/json; charset=utf-8",
+                                  extra={"Content-Disposition": "attachment; filename=bscope-nuclei.json"})
+            if fmt == "plextrac":
+                body = build_plextrac_csv(self.events, self.store,
+                                          getattr(self, "src_name", ""))
+                return self._send(200, body, ctype="text/csv; charset=utf-8",
+                                  extra={"Content-Disposition": "attachment; filename=bscope-plextrac.csv"})
+            if fmt in ("report", "findings"):
+                body = build_report_json(self.events, self.store,
+                                         getattr(self, "src_name", ""))
+                return self._send(200, body, ctype="application/json; charset=utf-8",
+                                  extra={"Content-Disposition": "attachment; filename=bscope-findings.json"})
+            if fmt in ("xlsx", "excel", "workbook"):
+                body = build_xlsx(self.events, self.findings, self.assets, self.store,
+                                  self.shots, getattr(self, "src_name", ""))
+                return self._send(200, body,
+                                  ctype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                  extra={"Content-Disposition": "attachment; filename=bscope-report.xlsx"})
             if fmt == "csv":
                 body = build_csv_export(self.events, self.store)
                 return self._send(200, body, ctype="text/csv; charset=utf-8",
@@ -2240,13 +3610,17 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/img/"):
             return self._serve_image(path[len("/img/"):])
 
+        if path.startswith("/evidence/"):
+            return self._serve_evidence(path[len("/evidence/"):])
+
         return self._send(404, "not found", ctype="text/plain; charset=utf-8")
 
     do_HEAD = do_GET
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
-        if path not in ("/api/triage", "/api/shot_triage"):
+        if path not in ("/api/triage", "/api/shot_triage",
+                        "/api/evidence", "/api/evidence_delete"):
             return self._send(404, "not found", ctype="text/plain; charset=utf-8")
         try:
             n = int(self.headers.get("Content-Length", 0))
@@ -2262,11 +3636,82 @@ class Handler(BaseHTTPRequestHandler):
                                  allowed=SHOT_STATUS_KEYS)
             return self._send(200, json.dumps(res), ctype="application/json; charset=utf-8")
 
+        if path == "/api/evidence":
+            return self._save_evidence(body)
+        if path == "/api/evidence_delete":
+            return self._delete_evidence(body)
+
         fid = body.get("id")
         if not fid:
             return self._send(400, "missing id", ctype="text/plain; charset=utf-8")
         res = self.store.set(fid, status=body.get("status"), notes=body.get("notes"))
         return self._send(200, json.dumps(res), ctype="application/json; charset=utf-8")
+
+    # ---- evidence screenshots pasted onto a finding ----
+    _EV_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
+
+    def _save_evidence(self, body):
+        fid = (body.get("id") or "").strip()
+        data = body.get("data") or ""      # data URL: data:image/png;base64,....
+        if not fid or not re.match(r"^[0-9a-f]{6,16}$", fid):
+            return self._send(400, "bad id", ctype="text/plain; charset=utf-8")
+        m = re.match(r"^data:(image/(?:png|jpeg|webp|gif));base64,(.+)$", data, re.S)
+        if not m:
+            return self._send(400, "expected a base64 image data URL",
+                              ctype="text/plain; charset=utf-8")
+        ext = self._EV_EXT.get(m.group(1), ".png")
+        try:
+            raw = base64.b64decode(m.group(2), validate=True)
+        except Exception:
+            return self._send(400, "bad base64", ctype="text/plain; charset=utf-8")
+        if len(raw) > 12 * 1024 * 1024:
+            return self._send(413, "image too large (max 12MB)", ctype="text/plain; charset=utf-8")
+        try:
+            os.makedirs(self.evidence_dir, exist_ok=True)
+            fname = "%s-%d%s" % (fid, int(time.time() * 1000), ext)
+            with open(os.path.join(self.evidence_dir, fname), "wb") as f:
+                f.write(raw)
+        except OSError as e:
+            return self._send(500, "could not save: %s" % e, ctype="text/plain; charset=utf-8")
+        rec = self.store.add_evidence(fid, fname)
+        return self._send(200, json.dumps({"evidence": rec.get("evidence", [])}),
+                          ctype="application/json; charset=utf-8")
+
+    def _delete_evidence(self, body):
+        fid = (body.get("id") or "").strip()
+        name = (body.get("name") or "").strip()
+        # name must belong to this finding and carry no path separators
+        if not fid or not name or "/" in name or "\\" in name or not name.startswith(fid + "-"):
+            return self._send(400, "bad request", ctype="text/plain; charset=utf-8")
+        try:
+            fp = os.path.join(self.evidence_dir, name)
+            if os.path.isfile(fp):
+                os.remove(fp)
+        except OSError:
+            pass
+        rec = self.store.remove_evidence(fid, name)
+        return self._send(200, json.dumps({"evidence": rec.get("evidence", [])}),
+                          ctype="application/json; charset=utf-8")
+
+    def _serve_evidence(self, name_encoded):
+        if not self.evidence_dir:
+            return self._send(404, "not found", ctype="text/plain; charset=utf-8")
+        name = urllib.parse.unquote(name_encoded)
+        if "/" in name or "\\" in name or os.path.sep in name:
+            return self._send(403, "forbidden", ctype="text/plain; charset=utf-8")
+        full = os.path.realpath(os.path.join(self.evidence_dir, name))
+        root_real = os.path.realpath(self.evidence_dir)
+        if not (full == root_real or full.startswith(root_real + os.sep)):
+            return self._send(403, "forbidden", ctype="text/plain; charset=utf-8")
+        if not os.path.isfile(full):
+            return self._send(404, "not found", ctype="text/plain; charset=utf-8")
+        ctype = MIME.get(os.path.splitext(full)[1].lower(), "application/octet-stream")
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except OSError:
+            return self._send(404, "not found", ctype="text/plain; charset=utf-8")
+        self._send(200, data, ctype=ctype, extra={"Cache-Control": "max-age=60"})
 
     def _serve_image(self, rel_encoded):
         if not self.shots_root:
@@ -2353,6 +3798,7 @@ def main():
     Handler.store = store
     Handler.shots = shots
     Handler.shots_root = shots_root
+    Handler.evidence_dir = state_path + ".evidence"
     Handler.gw_by_file = gw_by_file
     Handler.gw_by_url = gw_by_url
     Handler.src_name = os.path.basename(args.infile)

@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # recon.sh - end-to-end external recon built entirely on BBOT.
 #
-# Pipeline:
+# Pipeline (full / "passive + active" mode):
 #   1. Passive discovery  (BBOT subdomain-enum, passive only) on the seed domains
 #   2. Scope verification (landlord.py) on everything found, against scope_ips.txt
 #   3. Active coverage     (BBOT, loud web + nuclei + screenshots) on the
 #                          in-scope hosts landlord confirmed - nothing else
 #   4. Triage              (bscope.py) serves a dashboard of the active results
+#
+# Scan modes (chosen at launch, interactively, or with a flag):
+#   * passive   - steps 1-2 only: discover + scope-check, never touch the target
+#   * both      - the full 4-step pipeline above (default)
+#   * active    - skip discovery/scope-check and actively scan the seeds + scope
+#                 directly, confined by the scope file and BBOT --strict-scope
 #
 # Every host that gets actively scanned has first been confirmed in scope by
 # landlord.py. Out-of-scope and cloud-provider hosts are reported, never touched.
@@ -25,7 +31,11 @@
 #   -c "Name"       client name for the landlord report
 #   -a "Name"       assessor/company name for the landlord report
 #   --gcp           also classify Google Cloud ranges in landlord
-#   --passive-only  stop after step 2 (discovery + scope check, no active scan)
+#   --passive-only  passive mode: stop after step 2 (discovery + scope check)
+#   --active-only   active mode: skip discovery/scope-check, actively scan the
+#                   seeds + scope directly (confined by scope + --strict-scope)
+#                   With neither flag, on an interactive terminal you'll be asked
+#                   to choose passive / both / active at launch.
 #   --deep          kitchen-sink active scan: adds cloud-enum, code-enum,
 #                   email-enum, spider, webbrute, paramminer, lightfuzz and
 #                   baddns-heavy. Loud and intrusive - authorized engagements only.
@@ -48,7 +58,7 @@ set -o pipefail
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 SCOPE="" ; OUT="" ; CLIENT="" ; ASSESSOR="" ; GCP=0
-PASSIVE_ONLY=0 ; NO_SERVE=0 ; YES=0 ; DNS_QPS=500 ; BSCOPE_PORT=7373
+PASSIVE_ONLY=0 ; ACTIVE_ONLY=0 ; MODE="" ; NO_SERVE=0 ; YES=0 ; DNS_QPS=500 ; BSCOPE_PORT=7373
 DEEP=0
 # Standard active scan: solid coverage without the loudest modules.
 STD_PRESETS="web-heavy nuclei web-screenshots"
@@ -99,6 +109,7 @@ while [ $# -gt 0 ]; do
     -a) ASSESSOR=$2; shift 2 ;;
     --gcp) GCP=1; shift ;;
     --passive-only) PASSIVE_ONLY=1; shift ;;
+    --active-only) ACTIVE_ONLY=1; shift ;;
     --deep) DEEP=1; shift ;;
     --active-preset) ACTIVE_PRESETS=$2; PRESETS_SET=1; shift 2 ;;
     --active-modules) ACTIVE_MODULES=$2; MODULES_SET=1; shift 2 ;;
@@ -131,6 +142,34 @@ have bbot || die "bbot not found. Install it: pipx install bbot"
 have python3 || die "python3 not found."
 LANDLORD=$(find_helper landlord.py) || die "landlord.py not found on PATH or in $SELF_DIR"
 BSCOPE=$(find_helper bscope.py) || die "bscope.py not found on PATH or in $SELF_DIR"
+
+# ---------------------------------------------------------------- scan mode
+# Explicit flags win. Otherwise ask on an interactive terminal; fall back to the
+# full pipeline ("both") when non-interactive or -y, so scripted runs are unchanged.
+[ "$PASSIVE_ONLY" = 1 ] && [ "$ACTIVE_ONLY" = 1 ] \
+  && die "--passive-only and --active-only are mutually exclusive."
+if   [ "$PASSIVE_ONLY" = 1 ]; then MODE=passive
+elif [ "$ACTIVE_ONLY" = 1 ];  then MODE=active
+fi
+if [ -z "$MODE" ]; then
+  if [ "$YES" != 1 ] && { : </dev/tty; } 2>/dev/null; then
+    err "Choose a scan mode:"
+    err "  1) Passive only        - discovery + scope check, never touches the target"
+    err "  2) Passive + Active     - full pipeline: discover, scope-check, then scan (default)"
+    err "  3) Active only          - skip discovery/scope-check; scan the seeds + scope directly"
+    read -rp "Enter 1, 2 or 3 [2]: " _m </dev/tty
+    case "${_m:-2}" in
+      1) MODE=passive ;;
+      3) MODE=active  ;;
+      *) MODE=both    ;;
+    esac
+  else
+    MODE=both
+  fi
+fi
+# keep the legacy flag in sync for any downstream check
+[ "$MODE" = passive ] && PASSIVE_ONLY=1
+err "[*] Scan mode: $MODE"
 
 OUT="${OUT:-recon_$(date +%Y%m%d)}"
 mkdir -p "$OUT" || die "Could not create output dir: $OUT"
@@ -203,6 +242,7 @@ LAND_GCP=""; [ "$GCP" = 1 ] && LAND_GCP="--gcp"
 LAND_CLIENT=(); [ -n "$CLIENT" ] && LAND_CLIENT=(--client "$CLIENT")
 LAND_ASSESSOR=(); [ -n "$ASSESSOR" ] && LAND_ASSESSOR=(--assessor "$ASSESSOR")
 
+if [ "$MODE" != active ]; then
 # ==================================================================
 # STEP 1: Passive discovery
 # ==================================================================
@@ -369,21 +409,30 @@ else
 fi
 err "    (bare out-of-scope IP list -> $OOS_IPS)"
 
-if [ "$PASSIVE_ONLY" = 1 ]; then
+if [ "$MODE" = passive ]; then
   err ""
-  err "[*] --passive-only set. Stopping after scope verification."
+  err "[*] Passive mode. Stopping after scope verification."
   err "    For the client: $LAND_XLSX (full report)"
   err "                    $OOS_XLSX (out-of-scope / cloud hosts to confirm)"
   err "    Run the active scan later with the confirmed in-scope hosts."
   exit 0
 fi
+fi   # end of passive discovery + scope verification (skipped in active mode)
 
-# The active scan targets everything in scope: the confirmed hostnames PLUS the
-# bare in-scope IPs no hostname pointed at (so nothing on those IPs is missed).
-# This same list - one entry per host, hostname when there is one else the bare
-# IP, no overlap - is exactly what to feed Nessus/nmap.
+# Build the active target list.
 ACTIVE_TARGETS="$OUT/active_targets.txt"
-cat "$INSCOPE_HOSTS" "$NOHOST_IPS" | awk 'NF && !seen[$0]++' > "$ACTIVE_TARGETS"
+if [ "$MODE" = active ]; then
+  # No discovery / scope-check ran. Targets are your seed domains plus every
+  # individually enumerable in-scope IP. BBOT's own scope (the scope file passed
+  # as -t) and --strict-scope keep every active module confined to the scope.
+  cat "$SEEDS" "$SCOPE_IPS_ALL" 2>/dev/null | awk 'NF && !seen[$0]++' > "$ACTIVE_TARGETS"
+else
+  # The active scan targets everything in scope: the confirmed hostnames PLUS the
+  # bare in-scope IPs no hostname pointed at (so nothing on those IPs is missed).
+  # This same list - one entry per host, hostname when there is one else the bare
+  # IP, no overlap - is exactly what to feed Nessus/nmap.
+  cat "$INSCOPE_HOSTS" "$NOHOST_IPS" | awk 'NF && !seen[$0]++' > "$ACTIVE_TARGETS"
+fi
 ACTIVE_COUNT=$(wc -l < "$ACTIVE_TARGETS" | tr -d ' ')
 
 if [ "$ACTIVE_COUNT" -eq 0 ]; then
@@ -391,26 +440,40 @@ if [ "$ACTIVE_COUNT" -eq 0 ]; then
   err "[!] Nothing in scope to actively scan. Likely causes:"
   err "    - scope file lists IPs none of the discovered names resolve to, and"
   err "      the range was too large to enumerate host-by-host"
-  err "    - the client's sites are all behind a CDN (see the Azure/AWS tabs"
-  err "      of $LAND_XLSX and confirm those ranges with the client)"
+  [ "$MODE" != active ] && err "    - the client's sites are all behind a CDN (see the Azure/AWS tabs" \
+                        && err "      of $LAND_XLSX and confirm those ranges with the client)"
   exit 0
 fi
 
 # ==================================================================
-# STEP 3: Active coverage (only on confirmed in-scope hosts)
+# STEP 3: Active coverage
 # ==================================================================
 err ""
-err "### STEP 3/4  Active scan for maximum coverage"
+if [ "$MODE" = active ]; then
+  err "### Active scan for maximum coverage (active-only mode)"
+else
+  err "### STEP 3/4  Active scan for maximum coverage"
+fi
 [ "$DEEP" = 1 ] && err "    Profile: DEEP (kitchen-sink: cloud/code/email enum, spider, brute-force, fuzzing)"
 err "    Presets: $ACTIVE_PRESETS"
 err "    Modules: $ACTIVE_MODULES"
 err "    Targets: $ACTIVE_COUNT in-scope target(s) ONLY"
-err "             ($INSCOPE_COUNT hostname(s) + $NOHOST_COUNT bare IP(s) with no hostname)"
+if [ "$MODE" = active ]; then
+  err "             (seeds + enumerable in-scope IPs; confined by scope + --strict-scope)"
+else
+  err "             ($INSCOPE_COUNT hostname(s) + $NOHOST_COUNT bare IP(s) with no hostname)"
+fi
 err ""
 err "[!] This step sends traffic directly to the targets (port scans, web"
-err "    requests, nuclei templates, screenshots). Only in-scope targets are"
-err "    included: hostnames landlord confirmed, plus in-scope IPs that no"
-err "    hostname points at (so services on bare IPs aren't missed)."
+err "    requests, nuclei templates, screenshots)."
+if [ "$MODE" = active ]; then
+  err "[!] Active-only: passive discovery and the landlord scope-confirmation step"
+  err "    were SKIPPED. The scan is confined to your scope file by BBOT"
+  err "    --strict-scope; make sure that scope file is correct before proceeding."
+else
+  err "    Only in-scope targets are included: hostnames landlord confirmed, plus"
+  err "    in-scope IPs that no hostname points at (so services on bare IPs aren't missed)."
+fi
 
 if [ "$YES" != 1 ]; then
   if { : </dev/tty; } 2>/dev/null; then
@@ -428,8 +491,14 @@ ACTIVE_DIR="$OUT/03_active"
 # known in-scope targets, not discovery.
 # ACTIVE_CONFIG tunes the scan quieter/faster (see top of script); empty if
 # --no-config-tuning was passed.
+# In active-only mode nothing was scope-verified first, so pass the scope FILE as
+# BBOT's targets (-t) - it covers CIDRs/ranges that can't be enumerated host-by-
+# host - and seed from the target list. --strict-scope then confines every module
+# to the scope. In both/passive-derived mode, targets are the confirmed in-scope
+# hosts themselves.
+if [ "$MODE" = active ]; then SCAN_SCOPE_T="$SCOPE"; else SCAN_SCOPE_T="$ACTIVE_TARGETS"; fi
 # shellcheck disable=SC2086
-bbot -t "$ACTIVE_TARGETS" -s "$ACTIVE_TARGETS" \
+bbot -t "$SCAN_SCOPE_T" -s "$ACTIVE_TARGETS" \
      -p $ACTIVE_PRESETS -m $ACTIVE_MODULES \
      ${ACTIVE_CONFIG:+-c "${ACTIVE_CONFIG[@]}"} \
      --strict-scope \
@@ -441,17 +510,20 @@ ACTIVE_JSON="$ACTIVE_DIR/active/output.json"
 err "[+] Active scan complete -> $ACTIVE_JSON"
 
 # Scan-ready target lists for other tools (Nessus, nmap, etc.).
-# The complete in-scope IP list = IPs hostnames resolve to + bare in-scope IPs
-# with no hostname. This is the file to feed Nessus/nmap so nothing is missed.
-INSCOPE_IPS="$OUT/inscope_ips.txt"
-cat "$INSCOPE_IPS_WITH_HOST" "$NOHOST_IPS" \
-  | awk 'NF' | sort -u -t. -k1,1n -k2,2n -k3,3n -k4,4n > "$INSCOPE_IPS" 2>/dev/null \
-  || cat "$INSCOPE_IPS_WITH_HOST" "$NOHOST_IPS" | awk 'NF' | sort -u > "$INSCOPE_IPS"
-# Open-port targets BBOT confirmed, as host:port.
+# Open-port targets BBOT confirmed, as host:port (both modes).
 jq -r 'select(.type=="OPEN_TCP_PORT") | .data' "$ACTIVE_JSON" 2>/dev/null \
   | sort -u > "$OUT/open_ports.txt"
-err "[+] Scan-ready in-scope IPs (for Nessus/nmap) -> $INSCOPE_IPS"
-err "    ($(awk 'NF' "$INSCOPE_IPS_WITH_HOST" | wc -l | tr -d ' ') with a hostname, $NOHOST_COUNT without)"
+# The complete in-scope IP list = IPs hostnames resolve to + bare in-scope IPs
+# with no hostname. Only available when the scope-check step ran (not active-only).
+INSCOPE_IPS=""
+if [ "$MODE" != active ]; then
+  INSCOPE_IPS="$OUT/inscope_ips.txt"
+  cat "$INSCOPE_IPS_WITH_HOST" "$NOHOST_IPS" \
+    | awk 'NF' | sort -u -t. -k1,1n -k2,2n -k3,3n -k4,4n > "$INSCOPE_IPS" 2>/dev/null \
+    || cat "$INSCOPE_IPS_WITH_HOST" "$NOHOST_IPS" | awk 'NF' | sort -u > "$INSCOPE_IPS"
+  err "[+] Scan-ready in-scope IPs (for Nessus/nmap) -> $INSCOPE_IPS"
+  err "    ($(awk 'NF' "$INSCOPE_IPS_WITH_HOST" | wc -l | tr -d ' ') with a hostname, $NOHOST_COUNT without)"
+fi
 
 # Find the screenshots gowitness produced, if any
 SHOTS_DIR=""
@@ -463,7 +535,11 @@ done
 # STEP 4: Triage dashboard (bscope.py)
 # ==================================================================
 err ""
-err "### STEP 4/4  Triage dashboard (bscope.py)"
+if [ "$MODE" = active ]; then
+  err "### Triage dashboard (bscope.py)"
+else
+  err "### STEP 4/4  Triage dashboard (bscope.py)"
+fi
 VULN_COUNT=$(jq -r 'select(.type=="VULNERABILITY" or .type=="FINDING")' "$ACTIVE_JSON" 2>/dev/null | grep -c '"type"')
 err "[+] Active scan surfaced findings/vulnerabilities: ${VULN_COUNT:-0}"
 
@@ -473,18 +549,20 @@ SHOTS_ARG=()
 err ""
 err "==================================================================="
 err " Done. Everything is in: $OUT"
-err "   FOR THE CLIENT:"
-err "     Scope report (Excel)      : $LAND_XLSX"
-err "     Out-of-scope / cloud hosts: $OOS_XLSX"
-err "     Out-of-scope IPs only     : $OOS_IPS"
+if [ "$MODE" != active ]; then
+  err "   FOR THE CLIENT:"
+  err "     Scope report (Excel)      : $LAND_XLSX"
+  err "     Out-of-scope / cloud hosts: $OOS_XLSX"
+  err "     Out-of-scope IPs only     : $OOS_IPS"
+fi
 err "   FOR YOUR SCANNERS (Nessus, nmap...):"
 err "     Targets, 1 per host (Nessus): $ACTIVE_TARGETS"
-err "     In-scope IPs (ALL)        : $INSCOPE_IPS"
-err "     In-scope hostnames        : $INSCOPE_HOSTS"
-err "     In-scope IPs, no hostname : $NOHOST_IPS"
+[ -n "$INSCOPE_IPS" ]   && err "     In-scope IPs (ALL)        : $INSCOPE_IPS"
+[ "$MODE" != active ]   && err "     In-scope hostnames        : $INSCOPE_HOSTS"
+[ "$MODE" != active ]   && err "     In-scope IPs, no hostname : $NOHOST_IPS"
 err "     Confirmed open ports      : $OUT/open_ports.txt"
 err "   RAW BBOT OUTPUT:"
-err "     Passive                   : $PASSIVE_JSON"
+[ "$MODE" != active ]   && err "     Passive                   : $PASSIVE_JSON"
 err "     Active                    : $ACTIVE_JSON"
 err "==================================================================="
 
