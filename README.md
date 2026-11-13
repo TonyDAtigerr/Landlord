@@ -297,6 +297,302 @@ confirmed,reported` or `--all` (everything except *new*).
 
 ---
 
+## Under the hood: doing it all by hand
+
+`recon.sh` runs the commands below, in this order. This section shows each one
+and a manual way to get the same result without the kit, using BBOT, `jq`,
+`dig`, `curl`, [`grepcidr`](https://github.com/jrlevine/grepcidr)
+(`apt install grepcidr`) and a few lines of stdlib Python. It's useful for
+checking what the tools do, for debugging a run, or for running one stage by
+itself.
+
+The examples assume your two input files, `scope_ips.txt` and `domains.txt`,
+and that you're working in an output folder:
+
+```bash
+OUT=recon_$(date +%Y%m%d); mkdir -p "$OUT"
+```
+
+### 0. Prepare the inputs
+
+**Clean the seed list.** `recon.sh` merges every `-d` file and domain into
+`seeds.txt`, then strips comments and whitespace, lowercases it and removes
+duplicates:
+
+```bash
+cat domains.txt | sed 's/#.*//; s/[[:space:]]//g' | tr 'A-Z' 'a-z' \
+  | awk 'NF && !seen[$0]++' > "$OUT/seeds.txt"
+```
+
+**Expand the scope to single IPs.** Later steps need to know which in-scope
+IPs no hostname points at, so every CIDR and `a-b` range is expanded to its
+individual host addresses. Entries larger than a /16 (65,536 addresses) are
+skipped because you can't list them one host at a time; for those, hostname
+discovery is the only way in.
+
+```bash
+python3 - scope_ips.txt > "$OUT/scope_all_ips.txt" <<'PY'
+import sys, ipaddress
+for line in open(sys.argv[1]):
+    line = line.split("#", 1)[0].strip()
+    if not line: continue
+    if "-" in line and "/" not in line:
+        a, b = (ipaddress.ip_address(x.strip()) for x in line.split("-", 1))
+        nets = list(ipaddress.summarize_address_range(a, b))
+    else:
+        nets = [ipaddress.ip_network(line, strict=False)]
+    if sum(n.num_addresses for n in nets) > 65536: continue
+    for n in nets:
+        print(*([n.network_address] if n.num_addresses == 1 else n.hosts()), sep="\n")
+PY
+```
+
+### 1. Passive discovery (BBOT)
+
+This is the same BBOT command `recon.sh` runs. The scope file is the target
+(`-t`) and the domains are the seeds (`-s`). `-rf passive` limits BBOT to
+passive modules, so it never sends traffic to the client. `-em viewdns` turns
+off a noisy reverse-WHOIS module.
+
+```bash
+bbot -t scope_ips.txt -s "$OUT/seeds.txt" \
+     -p subdomain-enum -rf passive -em viewdns \
+     -c dns.brute_threads=500 \
+     -n passive -o "$OUT/01_passive" -y
+```
+
+BBOT writes `01_passive/passive/output.json` with one JSON event per line.
+Pull out every hostname it found, lowercased, without trailing dots or
+wildcards, and deduplicated:
+
+```bash
+jq -r 'select(.type=="DNS_NAME") | .data' "$OUT/01_passive/passive/output.json" \
+  | tr 'A-Z' 'a-z' | sed 's/\.$//; s/^\*\.//' | awk 'NF && !seen[$0]++' | sort \
+  > "$OUT/all_hostnames.txt"
+```
+
+### 2. Scope verification (what `landlord.py` does)
+
+`landlord.py` does four things: it downloads the cloud providers' published IP
+ranges, resolves every hostname, checks each IP against the ranges in a fixed
+order, and writes the results to a report.
+
+**2a. Download the cloud ranges.** landlord caches these in
+`~/.cache/landlord/` for 7 days (`--refresh` ignores the cache). Each command
+below writes `CIDR label` lines, where the label is the provider's
+service/region and becomes the "Provider / Service" column in the report.
+
+```bash
+# AWS
+curl -s https://ip-ranges.amazonaws.com/ip-ranges.json \
+  | jq -r '(.prefixes[] | "\(.ip_prefix) \(.service)/\(.region)"),
+           (.ipv6_prefixes[] | "\(.ipv6_prefix) \(.service)/\(.region)")' > aws_ranges.txt
+
+# Azure Public. Microsoft has no fixed URL for this file, so take the
+# current link from the download page. (For Azure Government use id=57063
+# and ServiceTags_AzureGovernment.)
+AZ=$(curl -sA 'Mozilla/5.0' 'https://www.microsoft.com/en-us/download/confirmation.aspx?id=56519' \
+  | grep -oE 'https://download\.microsoft\.com/download/[^"'\'']+/ServiceTags_Public_[0-9]{8}\.json' | head -1)
+curl -s "$AZ" | jq -r '.values[]
+  | (if (.properties.systemService // "") == "" then .name else .properties.systemService end) as $s
+  | .properties.region as $r | .properties.addressPrefixes[]
+  | if ($r // "") == "" then "\(.) \($s)" else "\(.) \($s)/\($r)" end' > azure_ranges.txt
+
+# Google Cloud (only with --gcp)
+curl -s https://www.gstatic.com/ipranges/cloud.json \
+  | jq -r '.prefixes[] | "\(.ipv4Prefix // .ipv6Prefix) \(.service)/\(.scope)"' > gcp_ranges.txt
+
+# Plain CIDR lists for grepcidr
+for p in aws azure gcp; do cut -d' ' -f1 ${p}_ranges.txt > $p.cidrs; done
+sed 's/#.*//; s/[[:space:]]//g' scope_ips.txt | awk NF > scope.cidrs
+```
+
+> landlord also accepts hostnames in the scope file and resolves them to IPs.
+> If yours has any, replace each one in `scope.cidrs` with the output of
+> `dig +short A <name>` and `dig +short AAAA <name>`.
+
+**2b. Resolve every hostname.** landlord collects every A and AAAA address
+(following CNAMEs) and records hosts that don't resolve. It writes one
+`ip hostname` pair per line:
+
+```bash
+: > unresolved.txt
+while read -r h; do
+  ips=$( { dig +short A "$h"; dig +short AAAA "$h"; } | grep -E '^[0-9.]+$|:' | sort -u)
+  if [ -z "$ips" ]; then echo "$h" >> unresolved.txt
+  else for ip in $ips; do echo "$ip $h"; done; fi
+done < "$OUT/all_hostnames.txt" > resolved.txt
+```
+
+(landlord runs 20 lookups at once. This loop runs them one at a time, which
+is slower but gives the same result.)
+
+**2c. Classify.** Each IP goes into the **first** list that contains it:
+scope, then Azure, then AWS, then GCP. That order means anything in your agreed
+scope counts as in scope even if it's also in a cloud range. Anything left over
+is out of scope:
+
+```bash
+cp resolved.txt remaining.txt
+for p in scope azure aws gcp; do
+  [ -f $p.cidrs ] || continue
+  grepcidr    -f $p.cidrs remaining.txt > class_$p.txt
+  grepcidr -v -f $p.cidrs remaining.txt > rest.tmp; mv rest.tmp remaining.txt
+done
+mv remaining.txt class_out.txt
+wc -l class_*.txt unresolved.txt
+```
+
+To fill in the Provider / Service column for a cloud list, look up which range
+each IP falls in:
+
+```bash
+python3 - aws_ranges.txt class_aws.txt <<'PY'
+import sys, ipaddress
+nets = [(ipaddress.ip_network(c, strict=False), l.strip())
+        for c, l in (x.split(None, 1) for x in open(sys.argv[1]) if x.strip())]
+for line in open(sys.argv[2]):
+    ip, host = line.split()
+    a = ipaddress.ip_address(ip)
+    print(host, ip, next((l for n, l in nets if a in n), "?"), sep="\t")
+PY
+```
+
+**2d. Build the report.** `scope_report.xlsx` contains these lists formatted as
+sheets:
+
+- **Hosts**: hostname, IP, IPv4/IPv6, classification and In Scope verdict. The
+  verdict is Yes for scope, No for out, Review (cloud) for any cloud provider,
+  and Unresolved.
+- **Summary**: a count for each classification, with a pie chart.
+- **Cloud Services**: hosts grouped by the provider's service.
+- **Methodology**: a legend and the source URLs.
+
+If you're doing it by hand, paste the `class_*.txt` files into a spreadsheet
+with a Classification column. landlord also saves the raw data as
+`scope_check.json`:
+`{"results": [{"host", "ip", "category", "match"}], "unresolved": [...]}`.
+
+### 3. Build the target lists
+
+These lists come from the classification above. They are what the active scan
+uses and what you give to other scanners.
+
+```bash
+cut -d' ' -f2 class_scope.txt | sort -u > "$OUT/inscope_hostnames.txt"
+cut -d' ' -f1 class_scope.txt | sort -u > "$OUT/inscope_ips_with_hostname.txt"
+
+# In-scope IPs that no hostname points at. They still get scanned.
+comm -23 <(sort -u "$OUT/scope_all_ips.txt") <(sort -u "$OUT/inscope_ips_with_hostname.txt") \
+  > "$OUT/inscope_ips_no_hostname.txt"
+
+# Out of scope. The client should confirm these. Cloud hosts go in the same
+# workbook (out_of_scope_for_client.xlsx), which has "Yours?" and "OK to test?" columns.
+cut -d' ' -f1 class_out.txt | sort -u > "$OUT/out_of_scope_ips.txt"
+
+# Active targets: one entry per host, using the hostname when there is one,
+# otherwise the bare IP. No overlap.
+cat "$OUT/inscope_hostnames.txt" "$OUT/inscope_ips_no_hostname.txt" \
+  | awk 'NF && !seen[$0]++' > "$OUT/active_targets.txt"
+
+# Every in-scope IP, sorted numerically
+cat "$OUT/inscope_ips_with_hostname.txt" "$OUT/inscope_ips_no_hostname.txt" | awk NF \
+  | sort -u -t. -k1,1n -k2,2n -k3,3n -k4,4n > "$OUT/inscope_ips.txt"
+```
+
+`--passive-only` stops here.
+
+### 4. Active scan (BBOT, scoped)
+
+The confirmed targets are passed as both BBOT's target (`-t`) and its seeds
+(`-s`), and `--strict-scope` prevents BBOT from expanding to anything outside
+that list. `subdomain-enum` is not run again, because this pass goes deeper on
+known hosts rather than looking for new ones. The `-c` options are the
+default tuning: no recursive DNS mutations, WAF avoidance during brute force,
+a limited spider, and wayback used only to find URLs.
+
+```bash
+bbot -t "$OUT/active_targets.txt" -s "$OUT/active_targets.txt" \
+     -p web-heavy nuclei web-screenshots \
+     -m portscan fingerprintx baddns \
+     -c modules.dnsbrute.recursive_mutations=false \
+        modules.dnscommonsrv.recursive_mutations=false \
+        modules.webbrute.avoid_wafs=true \
+        modules.wayback.urls=true modules.wayback.parameters=false modules.wayback.archive=false \
+        web.spider_distance=2 web.spider_depth=3 web.spider_links_per_page=10 \
+     --strict-scope \
+     -n active -o "$OUT/03_active" -y
+```
+
+- **`--deep`** replaces the presets with `web-heavy nuclei web-screenshots spider
+  webbrute paramminer lightfuzz baddns-heavy cloud-enum code-enum email-enum` and
+  the modules with `portscan fingerprintx`.
+- **`--no-config-tuning`** leaves out the entire `-c` block.
+- **`--active-only`** skips steps 1 to 3. The targets become
+  `seeds.txt` + `scope_all_ips.txt`, deduplicated, and `-t` is the scope file
+  itself, so `--strict-scope` limits the scan to your authorized ranges:
+  `bbot -t scope_ips.txt -s active_targets.txt ...`
+
+After the scan, collect the open ports BBOT confirmed and find the screenshots:
+
+```bash
+A="$OUT/03_active/active/output.json"
+jq -r 'select(.type=="OPEN_TCP_PORT") | .data' "$A" | sort -u > "$OUT/open_ports.txt"
+ls "$OUT/03_active/active/gowitness/screenshots" 2>/dev/null || ls "$OUT/03_active/active/gowitness"
+```
+
+### 5. Triage (what `bscope.py` shows you)
+
+bscope reads the same `output.json`. Here's how to get each tab with `jq`:
+
+```bash
+# Findings: the VULNERABILITY and FINDING events, sorted so critical comes first
+jq -r 'select(.type=="VULNERABILITY" or .type=="FINDING")
+  | [(.data.severity // "INFO"), .type, (.data.host // .host // ""), (.data.url // ""),
+     (.data.description // "")] | @tsv' "$A" \
+  | awk -F'\t' 'BEGIN{r["CRITICAL"]=1;r["HIGH"]=2;r["MEDIUM"]=3;r["LOW"]=4}
+                {print (r[toupper($1)]?r[toupper($1)]:5) "\t" $0}' \
+  | sort -n | cut -f2- > findings.tsv
+
+# Assets
+jq -r 'select(.type=="DNS_NAME") | .data'             "$A" | sort -u > subdomains.txt
+jq -r 'select(.type=="OPEN_TCP_PORT") | .data'        "$A" | sort -u > ports.txt
+jq -r 'select(.type=="TECHNOLOGY") | "\(.data.host)\t\(.data.technology)"' "$A" | sort -u > tech.tsv
+jq -r 'select(.type=="STORAGE_BUCKET") | .data.url'   "$A" | sort -u > buckets.txt
+
+# URLs tab: input for feroxbuster, ffuf, or Burp's target scope
+jq -r 'select(.type=="URL" or .type=="URL_UNVERIFIED") | .data' "$A" | sort -u > urls.txt
+
+# Emails tab, plus the user-enumeration commands bscope generates
+jq -r 'select(.type=="EMAIL_ADDRESS") | .data' "$A" | tr 'A-Z' 'a-z' | sort -u > emails.txt
+for d in $(cut -d@ -f2 emails.txt | sort -u); do
+  echo "o365spray --enum -U emails.txt --domain $d --enum-module oauth2"
+done
+```
+
+For **Screenshots**, open the gowitness folder in an image viewer.
+
+For **Triage**, open `findings.tsv` in a spreadsheet and add Status and Notes
+columns. bscope uses these statuses: new, triaging, confirmed, false positive,
+not exploitable, reviewed, reported. It saves the same information to
+`output.json.bscope.json`.
+
+For the **AttackForge export**, you need nuclei's own JSON. BBOT rewrites
+nuclei results as text, so bscope rebuilds the JSON from that text. To get the
+original JSON, run nuclei yourself against the same targets:
+`nuclei -l "$OUT/active_targets.txt" -jsonl -o nuclei.jsonl`.
+
+### 6. Report (what `report.py` does)
+
+`report.py` uses only the findings you marked **confirmed**, **reviewed** or
+**reported**, sorts them by severity and writes HTML or Markdown. To do the
+same from your triage spreadsheet, filter on those statuses, sort by severity,
+and write each finding up with its host, URL, description and notes. bscope's
+generic writeups (Description, Attack Scenario, Remediation) are a good
+starting structure for each one.
+
+---
+
 ## API keys (strongly recommended)
 
 Discovery quality scales with how many API keys BBOT has, and most of the
