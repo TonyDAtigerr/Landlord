@@ -152,7 +152,7 @@ stops so you can review the domains before running the pipeline:
 
 ```bash
 ./recon.sh -s external_scope.txt          # step 0: IPs -> hostnames -> domains
-# review recon_YYYYMMDD/00_seed_prep/domains.txt and crtsh_candidates.txt, then:
+# review 00_seed_prep/domains.txt, affiliate_root_domains.txt and crtsh_candidates.txt, then:
 ./recon.sh -s external_scope.txt -d recon_YYYYMMDD/00_seed_prep/domains.txt -o recon_YYYYMMDD
 ```
 
@@ -165,29 +165,65 @@ beats size — a wrong domain pulls unrelated infrastructure into the scan. Work
 the sources in this order, best first:
 
 **0. Starting from IP addresses only.** If the client gave you only IPs, have
-BBOT find every hostname tied to them. The command below writes one clean list
-of hostnames, plus the IPs, including the ones that have no hostname:
+BBOT find every hostname and IP tied to them:
 
 ```bash
-bbot -t external_scope.txt -m sslcert shodan_idb viewdns rapiddns hackertarget   --brief --event-types DNS_NAME IP_ADDRESS | sort -u > hostnames_ips.txt
+bbot -t external_scope.txt -m sslcert shodan_idb viewdns rapiddns hackertarget \
+  --brief --event-types DNS_NAME IP_ADDRESS -y | sort -u > hostnames_ips.txt
 ```
 
 `sslcert` reads the certificates the IPs serve, so it connects to them on TLS
-ports. The other modules are passive lookups. Reduce the hostnames to their
-root domains, then use those as the starting domains for steps 2 and 3 below
-(azmap and crt.sh):
+ports. The other modules are passive lookups.
 
-```bash
-grep -vE '^[0-9.]+$|:' hostnames_ips.txt | sed 's/\.$//; s/^\*\.//' | tr 'A-Z' 'a-z'   | awk -F. 'NF >= 2 {print $(NF-1) "." $NF}' | sort -u >> domains.txt   && sort -u -o domains.txt domains.txt && cat domains.txt
+With `--brief`, each line has three tab-separated fields, `TYPE`, `SCOPE` and
+`DATA`:
+
+```
+DNS_NAME     in-scope    www.example.com
+IP_ADDRESS   in-scope    203.0.113.5
+DNS_NAME     affiliate   portal.example.net
+IP_ADDRESS   affiliate   198.51.100.7
 ```
 
+- **in-scope**: inside `external_scope.txt`. That's one of your IPs, or a
+  hostname that resolves to one. These are your targets.
+- **affiliate** (or `distance-N`): related to a target but **outside** scope.
+  BBOT found it through an in-scope IP, for example a name on that IP's
+  certificate, but it resolves somewhere else: a CDN, cloud host, SaaS, or
+  the client's own infrastructure that isn't in your scope. Affiliate
+  hostnames are good leads for the domain list. Affiliate IPs must not be
+  tested without the client's sign-off.
+
+Split the file by type and scope:
+
+```bash
+awk -F'\t' '$1=="DNS_NAME"   && $2=="in-scope" {print $3}' hostnames_ips.txt > inscope_hostnames.txt
+awk -F'\t' '$1=="IP_ADDRESS" && $2=="in-scope" {print $3}' hostnames_ips.txt > inscope_ips.txt
+awk -F'\t' '$1=="DNS_NAME"   && $2!="in-scope" {print $3}' hostnames_ips.txt > affiliate_hostnames.txt
+awk -F'\t' '$1=="IP_ADDRESS" && $2!="in-scope" {print $3}' hostnames_ips.txt > affiliate_ips.txt
+```
+
+Reduce the in-scope hostnames to root domains and add them to `domains.txt`.
+They're the starting domains for steps 2 and 3 below (azmap and crt.sh):
+
+```bash
+sed 's/\.$//; s/^\*\.//' inscope_hostnames.txt | tr 'A-Z' 'a-z' \
+  | awk -F. 'NF >= 2 {print $(NF-1) "." $NF}' | sort -u >> domains.txt \
+  && sort -u -o domains.txt domains.txt && cat domains.txt
+```
+
+Do the same with `affiliate_hostnames.txt`, but review that list first. It
+often includes the client's own domains hosted elsewhere, mixed in with CDN
+and cloud names.
+
 `./recon.sh -s external_scope.txt` with no `-d` does all of this for you. It
-runs the BBOT command, splits the hostnames and IPs, takes the root domains
-(keeping `client.co.uk`-style names whole), expands them through azmap and
-crt.sh, and writes everything to `00_seed_prep/`. Then it stops. Review
-`domains.txt`, add the crt.sh keepers, and run the pipeline with `-d` pointing
-at the reviewed list. Once you have the in-scope IPs and a complete domains
-list, landlord does the rest.
+runs the BBOT command and splits the results by scope. It takes the root
+domains, keeping names like `client.co.uk` whole, and expands the in-scope ones
+through azmap and crt.sh. It writes everything to `00_seed_prep/` and then
+stops. Review `domains.txt`, add the keepers from `affiliate_root_domains.txt`
+and `crtsh_candidates.txt`, then run the pipeline with `-d` pointing at the
+reviewed list. Once you have the in-scope IPs and a complete domains list,
+landlord does the rest.
 
 **1. Ask the client at kickoff.** Anything they hand you is authoritative; start there.
 
@@ -304,9 +340,12 @@ Each run writes to an output folder (`recon_<date>` by default):
 - `open_ports.txt` — open ports BBOT confirmed, as `host:port`
 
 **Seed prep (`00_seed_prep/`, only when run without `-d`)**
-- `hostnames_ips.txt`: raw BBOT output (hostnames and IPs for the scope)
-- `hostnames.txt`, `ips.txt`: the same, split
-- `root_domains.txt`, `azmap_domains.txt`: root domains from the IPs, plus M365 tenant domains
+- `hostnames_ips.txt`: raw BBOT output (`TYPE`, `SCOPE`, `DATA`, tab-separated)
+- `inscope_hostnames.txt`, `inscope_ips.txt`: hostnames and IPs inside the scope file
+- `affiliate_hostnames.txt`: related hostnames outside scope. These are leads, not targets.
+- `affiliate_ips.txt`: related IPs outside scope. Don't test them without client sign-off.
+- `root_domains.txt`, `azmap_domains.txt`: in-scope root domains, plus M365 tenant domains
+- `affiliate_root_domains.txt`: root domains of the affiliate hostnames. Review it before using any of them.
 - `crtsh_candidates.txt`: root domains on shared certificates, with counts. Review it before using any of them.
 - `domains.txt`: the draft seed list (root + tenant domains). Review it, then pass it with `-d`.
 

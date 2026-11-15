@@ -19,9 +19,10 @@
 #
 # Seed prep (step 0, only IPs to start from):
 #   Run with -s and no -d. BBOT pulls every hostname it can find for the scope
-#   IPs (sslcert, shodan_idb, viewdns, rapiddns, hackertarget). The script
-#   splits them into a hostname list and an IP list, takes the root domains and
-#   expands them through azmap (M365 tenant domains) and crt.sh (shared certs),
+#   IPs (sslcert, shodan_idb, viewdns, rapiddns, hackertarget), split into
+#   in-scope and affiliate (related but OUT of scope) hostnames and IPs. The
+#   in-scope root domains are expanded through azmap (M365 tenant domains) and
+#   crt.sh (shared certs); affiliate root domains go to a review file. It
 #   then STOPS so you can review the domains before running the full pipeline.
 #   Note: sslcert connects to the scope IPs on TLS ports to read certificates.
 #
@@ -174,25 +175,57 @@ if [ "${#SEEDS_IN[@]}" -eq 0 ]; then
     | sort -u > "$HN_IPS" \
     || die "Seed-prep BBOT scan failed."
 
-  # Split into hostnames and bare IPs. --brief prints just the event data, but
-  # strip any leading "[TYPE]" tag and whitespace in case the format differs.
-  PREP_HOSTS="$PREP/hostnames.txt"
-  PREP_IPS="$PREP/ips.txt"
-  sed -E 's/^\[[A-Z_]+\][[:space:]]*//; s/[[:space:]].*$//; s/\.$//; s/^\*\.//' "$HN_IPS" \
-    | tr 'A-Z' 'a-z' | awk 'NF' | sort -u > "$PREP/.all"
-  grep -E '^[0-9.]+$|:' "$PREP/.all" | sort -u > "$PREP_IPS"
-  grep -vE '^[0-9.]+$|:' "$PREP/.all" | grep -E '^[a-z0-9_.-]+\.[a-z]{2,}$' | sort -u > "$PREP_HOSTS"
-  rm -f "$PREP/.all"
-  err "[+] $(wc -l < "$PREP_HOSTS" | tr -d ' ') hostname(s) -> $PREP_HOSTS"
-  err "[+] $(wc -l < "$PREP_IPS" | tr -d ' ') IP(s)       -> $PREP_IPS"
+  # --brief lines are tab-separated:  TYPE <tab> SCOPE <tab> DATA
+  #   SCOPE "in-scope"              -> inside the scope file (a target)
+  #   SCOPE "affiliate"/"distance-N" -> related to a target but OUTSIDE scope
+  #                                    (CDN, cloud, SaaS, a name off a cert...)
+  # Affiliate hostnames are still leads for the domain list; affiliate IPs are
+  # out of scope and must not be tested without client sign-off.
+  IN_HOSTS="$PREP/inscope_hostnames.txt"
+  IN_IPS="$PREP/inscope_ips.txt"
+  AFF_HOSTS="$PREP/affiliate_hostnames.txt"
+  AFF_IPS="$PREP/affiliate_ips.txt"
+  awk -F'\t' -v ih="$IN_HOSTS" -v ii="$IN_IPS" -v ah="$AFF_HOSTS" -v ai="$AFF_IPS" '
+    NF < 2 { next }
+    {
+      type = toupper($1); gsub(/[][[:space:]]/, "", type)
+      scope = tolower($2); gsub(/[[:space:]]/, "", scope)
+      data = tolower($NF); gsub(/[[:space:]]/, "", data)
+      sub(/\.$/, "", data); sub(/^\*\./, "", data)
+      if (data == "") next
+      ins = (scope == "in-scope")
+      if (type == "IP_ADDRESS")    print data > (ins ? ii : ai)
+      else if (type == "DNS_NAME") print data > (ins ? ih : ah)
+    }' "$HN_IPS"
+  for f in "$IN_HOSTS" "$IN_IPS" "$AFF_HOSTS" "$AFF_IPS"; do
+    touch "$f"; sort -u -o "$f" "$f"
+  done
+  # A hostname BBOT reported as both in-scope and affiliate counts as in-scope.
+  comm -23 "$AFF_HOSTS" "$IN_HOSTS" > "$AFF_HOSTS.tmp" && mv "$AFF_HOSTS.tmp" "$AFF_HOSTS"
+  [ -s "$HN_IPS" ] && [ ! -s "$IN_HOSTS" ] && [ ! -s "$AFF_HOSTS" ] && [ ! -s "$IN_IPS" ] && [ ! -s "$AFF_IPS" ] \
+    && err "[!] BBOT returned output but none of it parsed as TYPE<tab>SCOPE<tab>DATA - check $HN_IPS"
+  err "[+] In scope:   $(wc -l < "$IN_HOSTS" | tr -d ' ') hostname(s) -> $IN_HOSTS"
+  err "                $(wc -l < "$IN_IPS" | tr -d ' ') IP(s)       -> $IN_IPS"
+  err "[+] Affiliate:  $(wc -l < "$AFF_HOSTS" | tr -d ' ') hostname(s) -> $AFF_HOSTS  (leads only, NOT in scope)"
+  err "                $(wc -l < "$AFF_IPS" | tr -d ' ') IP(s)       -> $AFF_IPS  (out of scope - do not test)"
 
   # Root domains: last two labels, or last three under a common two-part
   # public suffix (client.co.uk, client.com.au).
+  to_roots() {
+    grep -E '^[a-z0-9_.-]+\.[a-z]{2,}$' "$1" \
+      | awk -F. 'NF >= 3 && length($NF) == 2 && $(NF-1) ~ /^(co|com|net|org|gov|ac|edu)$/ \
+                   {print $(NF-2) "." $(NF-1) "." $NF; next}
+                 NF >= 2 {print $(NF-1) "." $NF}' | sort -u
+  }
+  # In-scope roots seed the draft list and the azmap / crt.sh lookups.
   ROOTS="$PREP/root_domains.txt"
-  awk -F. 'NF >= 3 && length($NF) == 2 && $(NF-1) ~ /^(co|com|net|org|gov|ac|edu)$/ \
-             {print $(NF-2) "." $(NF-1) "." $NF; next}
-           NF >= 2 {print $(NF-1) "." $NF}' "$PREP_HOSTS" | sort -u > "$ROOTS"
-  err "[+] $(wc -l < "$ROOTS" | tr -d ' ') root domain(s) -> $ROOTS"
+  to_roots "$IN_HOSTS" > "$ROOTS"
+  # Affiliate roots (minus ones already in-scope) are a review file: often the
+  # client's own domains hosted elsewhere, but also CDN / cloud / SaaS names.
+  AFF_ROOTS="$PREP/affiliate_root_domains.txt"
+  to_roots "$AFF_HOSTS" | comm -23 - "$ROOTS" > "$AFF_ROOTS"
+  err "[+] $(wc -l < "$ROOTS" | tr -d ' ') in-scope root domain(s) -> $ROOTS"
+  err "[+] $(wc -l < "$AFF_ROOTS" | tr -d ' ') affiliate root domain(s), to review -> $AFF_ROOTS"
 
   # azmap: other domains registered in the same Microsoft 365 tenant.
   AZMAP="$PREP/azmap_domains.txt"
@@ -225,12 +258,16 @@ if [ "${#SEEDS_IN[@]}" -eq 0 ]; then
   err "==================================================================="
   err " Seed prep done. Review before running the pipeline:"
   err "   1. $DRAFT"
-  err "      root domains from the IPs + M365 tenant domains. Remove anything"
+  err "      in-scope root domains + M365 tenant domains. Remove anything"
   err "      that isn't the client (hosting, CDN, shared-hosting neighbours)."
-  err "   2. $CRTSH"
+  err "   2. $AFF_ROOTS"
+  err "      root domains of affiliate (out-of-scope) hostnames. Delete the ones"
+  err "      that aren't the client (CDN, cloud, SaaS), then append the keepers:"
+  err "        cat \"$AFF_ROOTS\" >> \"$DRAFT\" && sort -u -o \"$DRAFT\" \"$DRAFT\""
+  err "   3. $CRTSH"
   err "      delete the lines you don't want, then append the keepers:"
   err "        awk '{print \$2}' \"$CRTSH\" >> \"$DRAFT\" && sort -u -o \"$DRAFT\" \"$DRAFT\""
-  err "   3. Run the landlord pipeline with the reviewed domains:"
+  err "   4. Run the landlord pipeline with the reviewed domains:"
   err "        $0 -s \"$SCOPE\" -d \"$DRAFT\" -o \"$OUT\""
   err "==================================================================="
   exit 0
