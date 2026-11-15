@@ -17,14 +17,24 @@
 # Every host that gets actively scanned has first been confirmed in scope by
 # landlord.py. Out-of-scope and cloud-provider hosts are reported, never touched.
 #
+# Seed prep (step 0, only IPs to start from):
+#   Run with -s and no -d. BBOT pulls every hostname it can find for the scope
+#   IPs (sslcert, shodan_idb, viewdns, rapiddns, hackertarget). The script
+#   splits them into a hostname list and an IP list, takes the root domains and
+#   expands them through azmap (M365 tenant domains) and crt.sh (shared certs),
+#   then STOPS so you can review the domains before running the full pipeline.
+#   Note: sslcert connects to the scope IPs on TLS ports to read certificates.
+#
 # Usage:
 #   ./recon.sh -s scope_ips.txt -d domains.txt [options]
 #   ./recon.sh -s scope_ips.txt -d example.com -d example.net [options]
+#   ./recon.sh -s scope_ips.txt                 # seed prep: IPs -> domains
 #
 # Required:
 #   -s FILE         authorized scope: IPs, CIDRs, a-b ranges (landlord + BBOT scope)
 #   -d FILE|DOMAIN  seed domains: a file (one per line) or a literal domain.
-#                   Repeatable; mix files and domains freely.
+#                   Repeatable; mix files and domains freely. Leave out to run
+#                   seed prep (step 0) instead of the pipeline.
 #
 # Options:
 #   -o DIR          output directory (default: recon_<date>)
@@ -136,10 +146,96 @@ fi
 # ---------------------------------------------------------------- checks
 [ -n "$SCOPE" ] || { err "[!] -s scope file is required."; usage 1; }
 [ -f "$SCOPE" ] || die "Scope file not found: $SCOPE"
-[ "${#SEEDS_IN[@]}" -gt 0 ] || { err "[!] At least one -d seed domain or file is required."; usage 1; }
-
 have bbot || die "bbot not found. Install it: pipx install bbot"
 have python3 || die "python3 not found."
+
+# ==================================================================
+# STEP 0: Seed prep (no -d given) - scope IPs -> hostnames -> root domains
+# ==================================================================
+if [ "${#SEEDS_IN[@]}" -eq 0 ]; then
+  have jq   || die "jq not found (needed for azmap / crt.sh parsing)."
+  have curl || die "curl not found (needed for azmap / crt.sh lookups)."
+  OUT="${OUT:-recon_$(date +%Y%m%d)}"
+  PREP="$OUT/00_seed_prep"
+  mkdir -p "$PREP" || die "Could not create output dir: $PREP"
+  PREP=$(cd "$PREP" && pwd)
+
+  err "==================================================================="
+  err " recon.sh - STEP 0  Seed prep (no -d given: starting from scope IPs)"
+  err " Scope:  $SCOPE"
+  err " Output: $PREP"
+  err "==================================================================="
+  err "[*] BBOT: hostnames + IPs for the scope (sslcert, shodan_idb, viewdns, rapiddns, hackertarget)"
+  err "    sslcert connects to the scope IPs on TLS ports to read certificates."
+
+  HN_IPS="$PREP/hostnames_ips.txt"
+  bbot -t "$SCOPE" -m sslcert shodan_idb viewdns rapiddns hackertarget \
+       --brief --event-types DNS_NAME IP_ADDRESS -y \
+    | sort -u > "$HN_IPS" \
+    || die "Seed-prep BBOT scan failed."
+
+  # Split into hostnames and bare IPs. --brief prints just the event data, but
+  # strip any leading "[TYPE]" tag and whitespace in case the format differs.
+  PREP_HOSTS="$PREP/hostnames.txt"
+  PREP_IPS="$PREP/ips.txt"
+  sed -E 's/^\[[A-Z_]+\][[:space:]]*//; s/[[:space:]].*$//; s/\.$//; s/^\*\.//' "$HN_IPS" \
+    | tr 'A-Z' 'a-z' | awk 'NF' | sort -u > "$PREP/.all"
+  grep -E '^[0-9.]+$|:' "$PREP/.all" | sort -u > "$PREP_IPS"
+  grep -vE '^[0-9.]+$|:' "$PREP/.all" | grep -E '^[a-z0-9_.-]+\.[a-z]{2,}$' | sort -u > "$PREP_HOSTS"
+  rm -f "$PREP/.all"
+  err "[+] $(wc -l < "$PREP_HOSTS" | tr -d ' ') hostname(s) -> $PREP_HOSTS"
+  err "[+] $(wc -l < "$PREP_IPS" | tr -d ' ') IP(s)       -> $PREP_IPS"
+
+  # Root domains: last two labels, or last three under a common two-part
+  # public suffix (client.co.uk, client.com.au).
+  ROOTS="$PREP/root_domains.txt"
+  awk -F. 'NF >= 3 && length($NF) == 2 && $(NF-1) ~ /^(co|com|net|org|gov|ac|edu)$/ \
+             {print $(NF-2) "." $(NF-1) "." $NF; next}
+           NF >= 2 {print $(NF-1) "." $NF}' "$PREP_HOSTS" | sort -u > "$ROOTS"
+  err "[+] $(wc -l < "$ROOTS" | tr -d ' ') root domain(s) -> $ROOTS"
+
+  # azmap: other domains registered in the same Microsoft 365 tenant.
+  AZMAP="$PREP/azmap_domains.txt"
+  err "[*] azmap: M365 tenant domains for each root domain..."
+  while read -r d; do
+    [ -n "$d" ] || continue
+    curl -s --max-time 30 "https://azmap.dev/api/tenant?domain=$d&extract=true" \
+      | jq -r '.related_domains[]?' 2>/dev/null
+  done < "$ROOTS" | tr 'A-Z' 'a-z' | awk 'NF' | sort -u > "$AZMAP"
+  err "[+] $(wc -l < "$AZMAP" | tr -d ' ') tenant domain(s) -> $AZMAP"
+
+  # crt.sh: root domains sharing certificates with the known ones. These carry
+  # CDN / hosting / CA names too, so they go to a review file, not the seeds.
+  CRTSH="$PREP/crtsh_candidates.txt"
+  err "[*] crt.sh: root domains on shared certificates (can be slow)..."
+  sort -u "$ROOTS" "$AZMAP" | while read -r d; do
+    [ -n "$d" ] || continue
+    curl -s --max-time 90 "https://crt.sh/?q=$d&output=json" \
+      | jq -r '.[].name_value' 2>/dev/null
+  done | tr 'A-Z' 'a-z' | sed 's/^\*\.//' | grep -E '^[a-z0-9.-]+$' \
+    | awk -F. 'NF >= 2 {print $(NF-1) "." $NF}' \
+    | sort | uniq -c | sort -rn > "$CRTSH"
+  err "[+] $(wc -l < "$CRTSH" | tr -d ' ') candidate root domain(s), most common first -> $CRTSH"
+
+  # Draft seed list: root domains from the IPs + tenant domains.
+  DRAFT="$PREP/domains.txt"
+  sort -u "$ROOTS" "$AZMAP" | awk 'NF' > "$DRAFT"
+
+  err ""
+  err "==================================================================="
+  err " Seed prep done. Review before running the pipeline:"
+  err "   1. $DRAFT"
+  err "      root domains from the IPs + M365 tenant domains. Remove anything"
+  err "      that isn't the client (hosting, CDN, shared-hosting neighbours)."
+  err "   2. $CRTSH"
+  err "      delete the lines you don't want, then append the keepers:"
+  err "        awk '{print \$2}' \"$CRTSH\" >> \"$DRAFT\" && sort -u -o \"$DRAFT\" \"$DRAFT\""
+  err "   3. Run the landlord pipeline with the reviewed domains:"
+  err "        $0 -s \"$SCOPE\" -d \"$DRAFT\" -o \"$OUT\""
+  err "==================================================================="
+  exit 0
+fi
+
 LANDLORD=$(find_helper landlord.py) || die "landlord.py not found on PATH or in $SELF_DIR"
 BSCOPE=$(find_helper bscope.py) || die "bscope.py not found on PATH or in $SELF_DIR"
 

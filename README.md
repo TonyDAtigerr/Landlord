@@ -145,6 +145,17 @@ python3 report.py recon_YYYYMMDD/03_active/active/output.json \
 touch. Use `--passive-only` to stop after the scope report, or `-y` to skip the
 pause.
 
+**Only have a list of IPs?** Run `recon.sh` with the scope file and no `-d`.
+It does the seed prep described in
+*Starting from IP addresses only* (step 0 of [Finding the client's root domains](#finding-the-clients-root-domains)), then
+stops so you can review the domains before running the pipeline:
+
+```bash
+./recon.sh -s external_scope.txt          # step 0: IPs -> hostnames -> domains
+# review recon_YYYYMMDD/00_seed_prep/domains.txt and crtsh_candidates.txt, then:
+./recon.sh -s external_scope.txt -d recon_YYYYMMDD/00_seed_prep/domains.txt -o recon_YYYYMMDD
+```
+
 ---
 
 ## Finding the client's root domains
@@ -152,6 +163,31 @@ pause.
 Everything starts from `domains.txt`. These become BBOT's seeds, so accuracy
 beats size — a wrong domain pulls unrelated infrastructure into the scan. Work
 the sources in this order, best first:
+
+**0. Starting from IP addresses only.** If the client gave you only IPs, have
+BBOT find every hostname tied to them. The command below writes one clean list
+of hostnames, plus the IPs, including the ones that have no hostname:
+
+```bash
+bbot -t external_scope.txt -m sslcert shodan_idb viewdns rapiddns hackertarget   --brief --event-types DNS_NAME IP_ADDRESS | sort -u > hostnames_ips.txt
+```
+
+`sslcert` reads the certificates the IPs serve, so it connects to them on TLS
+ports. The other modules are passive lookups. Reduce the hostnames to their
+root domains, then use those as the starting domains for steps 2 and 3 below
+(azmap and crt.sh):
+
+```bash
+grep -vE '^[0-9.]+$|:' hostnames_ips.txt | sed 's/\.$//; s/^\*\.//' | tr 'A-Z' 'a-z'   | awk -F. 'NF >= 2 {print $(NF-1) "." $NF}' | sort -u >> domains.txt   && sort -u -o domains.txt domains.txt && cat domains.txt
+```
+
+`./recon.sh -s external_scope.txt` with no `-d` does all of this for you. It
+runs the BBOT command, splits the hostnames and IPs, takes the root domains
+(keeping `client.co.uk`-style names whole), expands them through azmap and
+crt.sh, and writes everything to `00_seed_prep/`. Then it stops. Review
+`domains.txt`, add the crt.sh keepers, and run the pipeline with `-d` pointing
+at the reviewed list. Once you have the in-scope IPs and a complete domains
+list, landlord does the rest.
 
 **1. Ask the client at kickoff.** Anything they hand you is authoritative; start there.
 
@@ -233,7 +269,7 @@ Run `./recon.sh -h` for the built-in help. Full flag list:
 | Flag | Argument | What it does |
 | --- | --- | --- |
 | `-s` | FILE | **Required.** Authorized scope: IPs, CIDRs, or `a-b` ranges, one per line. Used as both the landlord scope and BBOT's scope. |
-| `-d` | FILE or DOMAIN | **Required, repeatable.** Seed domains: a file (one per line) or a literal domain. Mix files and domains freely. |
+| `-d` | FILE or DOMAIN | Repeatable. Seed domains: a file (one per line) or a literal domain. Mix files and domains freely. Leave it out to run seed prep (step 0: IPs → hostnames → domains via BBOT, azmap and crt.sh), which stops before the pipeline. |
 | `-o` | DIR | Output directory (default: `recon_<date>`). |
 | `-c` | "Name" | Client name shown on the reports. |
 | `-a` | "Name" | Assessor / your company name shown on the reports. |
@@ -266,6 +302,13 @@ Each run writes to an output folder (`recon_<date>` by default):
 - `inscope_hostnames.txt` — confirmed in-scope hostnames
 - `inscope_ips_no_hostname.txt` — in-scope IPs no hostname points at (subset of the above)
 - `open_ports.txt` — open ports BBOT confirmed, as `host:port`
+
+**Seed prep (`00_seed_prep/`, only when run without `-d`)**
+- `hostnames_ips.txt`: raw BBOT output (hostnames and IPs for the scope)
+- `hostnames.txt`, `ips.txt`: the same, split
+- `root_domains.txt`, `azmap_domains.txt`: root domains from the IPs, plus M365 tenant domains
+- `crtsh_candidates.txt`: root domains on shared certificates, with counts. Review it before using any of them.
+- `domains.txt`: the draft seed list (root + tenant domains). Review it, then pass it with `-d`.
 
 **Raw / intermediate**
 - `01_passive/`, `03_active/` — raw BBOT output (NDJSON + CSV)
