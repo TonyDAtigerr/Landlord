@@ -137,7 +137,7 @@ not use the module:
 #    marking real issues Confirmed / Reported.
 
 # 4. Generate the client report from your triage
-python3 report.py recon_YYYYMMDD/03_active/active/output.json \
+python3 report.py 03_active/active/output.json \
     --client "Client Name" --assessor "Your Company" -o client_report.html
 ```
 
@@ -152,8 +152,128 @@ stops so you can review the domains before running the pipeline:
 
 ```bash
 ./recon.sh -s external_scope.txt          # step 0: IPs -> hostnames -> domains
-# review 00_seed_prep/domains.txt, affiliate_root_domains.txt and crtsh_candidates.txt, then:
-./recon.sh -s external_scope.txt -d recon_YYYYMMDD/00_seed_prep/domains.txt -o recon_YYYYMMDD
+# review domains.txt, affiliate_root_domains.txt and crtsh_candidates.txt, then:
+./recon.sh -s external_scope.txt -d domains.txt
+```
+
+---
+
+## Usage
+
+Run `recon.sh` from your engagement folder. Everything it writes lands there
+(or in the `-o` folder). `./recon.sh -h` prints the built-in help.
+
+When you start a run with seed domains on a terminal, `recon.sh` asks which
+mode to use: **1) passive only**, **2) passive + active** (default), or
+**3) active only**. The `--passive-only` / `--active-only` flags skip that
+question, and so does `-y`, which picks the full pipeline.
+
+### Pick your starting point
+
+**You have IPs and domains (the normal case).** This runs the full pipeline:
+discover, scope-check, active scan, then the triage dashboard.
+
+```bash
+./recon.sh -s scope_ips.txt -d domains.txt
+```
+
+**You have IPs but no domains.** Leave out `-d`. Seed prep finds the hostnames
+on your IPs, works out their root domains, expands them through azmap and
+crt.sh, and stops without scanning anything. Review `domains.txt` and the
+two candidate files, then run the command it prints:
+
+```bash
+./recon.sh -s scope_ips.txt                    # step 0: IPs -> domains, then stop
+./recon.sh -s scope_ips.txt -d domains.txt     # full pipeline with the reviewed list
+```
+
+**You have domains but no IPs.** The scope file is required, but it can also
+list hostnames: each one is resolved and the IPs it points at become your
+scope. Start passive. Everything discovered on *other* IPs goes into
+`out_of_scope_for_client.xlsx`, so the client can confirm which ones are
+theirs and that you're allowed to test them:
+
+```bash
+./recon.sh -s domains.txt -d domains.txt --passive-only
+```
+
+Once the client has confirmed, put the approved IPs in a scope file and run
+the full pipeline. If a domain sits behind a CDN (Cloudflare, Akamai...), its
+scope entry resolves to the CDN's shared IPs. Don't scan actively off a scope
+like that.
+
+**You have one or two domains and don't want a file.** `-d` takes literal
+domains and can be repeated. You can mix files and domains:
+
+```bash
+./recon.sh -s scope_ips.txt -d example.com -d example.net
+./recon.sh -s scope_ips.txt -d domains.txt -d late-addition.com
+```
+
+### Control how loud it gets
+
+```bash
+# Passive only: discovery + scope report. Never touches the client.
+./recon.sh -s scope_ips.txt -d domains.txt --passive-only
+
+# Active only: skip discovery and the scope check, and scan the seeds + scope
+# directly (still confined by --strict-scope). Use it when scope is already settled.
+./recon.sh -s scope_ips.txt -d domains.txt --active-only
+
+# Deep: adds cloud-bucket, code-leak and email enumeration, spidering,
+# directory brute-force, parameter mining and light fuzzing. Loud and intrusive.
+./recon.sh -s scope_ips.txt -d domains.txt --deep
+
+# Your own active scan: replace the BBOT presets and/or modules outright
+./recon.sh -s scope_ips.txt -d domains.txt \
+  --active-preset "web nuclei-budget web-screenshots" --active-modules "portscan"
+
+# Turn off the quieter/faster tuning (WAF avoidance, bounded spider, etc.)
+./recon.sh -s scope_ips.txt -d domains.txt --no-config-tuning
+
+# Slow down DNS brute-forcing (default 500 queries/sec)
+./recon.sh -s scope_ips.txt -d domains.txt --dns-qps 100
+```
+
+### Reports, output and the dashboard
+
+```bash
+# Client and company names on the Excel scope report
+./recon.sh -s scope_ips.txt -d domains.txt -c "Acme Corp" -a "Our Company"
+
+# Write everything to a folder instead of the current directory
+./recon.sh -s scope_ips.txt -d domains.txt -o acme_external
+
+# Also classify Google Cloud ranges (Azure and AWS are always checked)
+./recon.sh -s scope_ips.txt -d domains.txt --gcp
+
+# Don't launch bscope at the end; it prints the command to run it later
+./recon.sh -s scope_ips.txt -d domains.txt --no-serve
+
+# Run bscope on another port (default 7373)
+./recon.sh -s scope_ips.txt -d domains.txt --bscope-port 8080
+
+# Unattended (tmux, cron, a VPS): no mode question and no pause before the
+# active scan. Only use it once you trust the scope file.
+./recon.sh -s scope_ips.txt -d domains.txt -y
+```
+
+### Putting it together
+
+A typical external test that starts from an IP list only:
+
+```bash
+mkdir acme && cd acme
+cp ~/Downloads/acme_scope.txt scope.txt
+
+../Landlord/recon.sh -s scope.txt                         # 1. IPs -> draft domains
+vim domains.txt affiliate_root_domains.txt crtsh_candidates.txt   # 2. review
+../Landlord/recon.sh -s scope.txt -d domains.txt \
+  --passive-only -c "Acme Corp" -a "Our Company"         # 3. passive + scope report
+# 4. send out_of_scope_for_client.xlsx to the client; add any IPs they approve to scope.txt
+../Landlord/recon.sh -s scope.txt -d domains.txt --active-only -c "Acme Corp" -a "Our Company"   # 5. scan + triage
+python3 ../Landlord/report.py 03_active/active/output.json \
+  --client "Acme Corp" --assessor "Our Company" -o client_report.html                         # 6. report
 ```
 
 ---
@@ -173,7 +293,7 @@ the sources in this order, best first:
 
 It finds every hostname tied to those IPs, works out their root domains,
 expands those through azmap and crt.sh (steps 2 and 3 below), and writes the
-results to `recon_<date>/00_seed_prep/`. Then it stops, without scanning
+results to the current directory (or the `-o` folder). Then it stops, without scanning
 anything. Every hostname and IP it finds is labelled one of two ways:
 
 - **in-scope**: inside your scope file. That's one of your IPs, or a hostname
@@ -192,7 +312,7 @@ Review three files, then run the pipeline with the reviewed list:
 3. `crtsh_candidates.txt`: root domains on shared certificates. Add the keepers the same way.
 
 ```bash
-./recon.sh -s external_scope.txt -d recon_<date>/00_seed_prep/domains.txt -o recon_<date>
+./recon.sh -s external_scope.txt -d domains.txt
 ```
 
 `recon.sh` prints the exact commands at the end of the run. To see what it
@@ -281,11 +401,12 @@ Run `./recon.sh -h` for the built-in help. Full flag list:
 | --- | --- | --- |
 | `-s` | FILE | **Required.** Authorized scope: IPs, CIDRs, or `a-b` ranges, one per line. Used as both the landlord scope and BBOT's scope. |
 | `-d` | FILE or DOMAIN | Repeatable. Seed domains: a file (one per line) or a literal domain. Mix files and domains freely. Leave it out to run seed prep (step 0: IPs → hostnames → domains via BBOT, azmap and crt.sh), which stops before the pipeline. |
-| `-o` | DIR | Output directory (default: `recon_<date>`). |
+| `-o` | DIR | Output directory (default: the current directory). |
 | `-c` | "Name" | Client name shown on the reports. |
 | `-a` | "Name" | Assessor / your company name shown on the reports. |
 | `--gcp` | | Also classify Google Cloud ranges in the scope report. |
 | `--passive-only` | | Stop after discovery and the scope report. No active scan. |
+| `--active-only` | | Skip discovery and the scope check; actively scan the seeds + scope file directly, still confined by `--strict-scope`. With neither mode flag, an interactive run asks you to pick passive / both / active. |
 | `--deep` | | Kitchen-sink active scan (see *Tuning the active scan* below). Loud and intrusive; authorized engagements only. |
 | `--active-preset` | "P ..." | Override the active-scan BBOT presets entirely. |
 | `--active-modules` | "M ..." | Override the active-scan BBOT modules entirely. |
@@ -300,7 +421,7 @@ Run `./recon.sh -h` for the built-in help. Full flag list:
 
 ## Output files
 
-Each run writes to an output folder (`recon_<date>` by default):
+Each run writes to the current directory by default, so run it from your engagement folder (or pass `-o DIR`). Paths in the console output are printed relative to where you ran it, so you can copy them straight into the next command:
 
 **For the client**
 - `scope_report.xlsx` — full classification report with charts
@@ -314,15 +435,15 @@ Each run writes to an output folder (`recon_<date>` by default):
 - `inscope_ips_no_hostname.txt` — in-scope IPs no hostname points at (subset of the above)
 - `open_ports.txt` — open ports BBOT confirmed, as `host:port`
 
-**Seed prep (`00_seed_prep/`, only when run without `-d`)**
+**Seed prep (only when run without `-d`)**
 - `hostnames_ips.txt`: raw BBOT output (`TYPE`, `SCOPE`, `DATA`, tab-separated)
-- `inscope_hostnames.txt`, `inscope_ips.txt`: hostnames and IPs inside the scope file
+- `seed_inscope_hostnames.txt`, `seed_inscope_ips.txt`: hostnames and IPs inside the scope file
 - `affiliate_hostnames.txt`: related hostnames outside scope. These are leads, not targets.
 - `affiliate_ips.txt`: related IPs outside scope. Don't test them without client sign-off.
 - `root_domains.txt`, `azmap_domains.txt`: in-scope root domains, plus M365 tenant domains
 - `affiliate_root_domains.txt`: root domains of the affiliate hostnames. Review it before using any of them.
 - `crtsh_candidates.txt`: root domains on shared certificates, with counts. Review it before using any of them.
-- `domains.txt`: the draft seed list (root + tenant domains). Review it, then pass it with `-d`.
+- `domains.txt`: the draft seed list (root + tenant domains). Review it, then pass it with `-d`. If a `domains.txt` already exists, it is kept as `domains.txt.bak`.
 
 **Raw / intermediate**
 - `01_passive/`, `03_active/` — raw BBOT output (NDJSON + CSV)
@@ -364,10 +485,11 @@ checking what the tools do, for debugging a run, or for running one stage by
 itself.
 
 The examples assume your two input files, `scope_ips.txt` and `domains.txt`,
-and that you're working in an output folder:
+and that you're working in your engagement folder, which is also the output
+folder:
 
 ```bash
-OUT=recon_$(date +%Y%m%d); mkdir -p "$OUT"
+OUT=.
 ```
 
 ### Seed prep: starting from IPs only
@@ -380,7 +502,7 @@ so it connects to them on TLS ports. The other four modules are passive
 lookups.
 
 ```bash
-P="$OUT/00_seed_prep"; mkdir -p "$P"
+P="$OUT"
 bbot -t scope_ips.txt -m sslcert shodan_idb viewdns rapiddns hackertarget \
   --brief --event-types DNS_NAME IP_ADDRESS -y | sort -u > "$P/hostnames_ips.txt"
 ```
@@ -399,8 +521,8 @@ IP_ADDRESS   affiliate   198.51.100.7
 **Split the file by type and scope:**
 
 ```bash
-awk -F'\t' '$1=="DNS_NAME"   && $2=="in-scope" {print $3}' "$P/hostnames_ips.txt" > "$P/inscope_hostnames.txt"
-awk -F'\t' '$1=="IP_ADDRESS" && $2=="in-scope" {print $3}' "$P/hostnames_ips.txt" > "$P/inscope_ips.txt"
+awk -F'\t' '$1=="DNS_NAME"   && $2=="in-scope" {print $3}' "$P/hostnames_ips.txt" > "$P/seed_inscope_hostnames.txt"
+awk -F'\t' '$1=="IP_ADDRESS" && $2=="in-scope" {print $3}' "$P/hostnames_ips.txt" > "$P/seed_inscope_ips.txt"
 awk -F'\t' '$1=="DNS_NAME"   && $2!="in-scope" {print $3}' "$P/hostnames_ips.txt" > "$P/affiliate_hostnames.txt"
 awk -F'\t' '$1=="IP_ADDRESS" && $2!="in-scope" {print $3}' "$P/hostnames_ips.txt" > "$P/affiliate_ips.txt"
 ```
@@ -411,7 +533,7 @@ also keeps names under two-part suffixes whole (`client.co.uk`), which this
 short version doesn't.
 
 ```bash
-sed 's/\.$//; s/^\*\.//' "$P/inscope_hostnames.txt" | tr 'A-Z' 'a-z' \
+sed 's/\.$//; s/^\*\.//' "$P/seed_inscope_hostnames.txt" | tr 'A-Z' 'a-z' \
   | awk -F. 'NF >= 2 {print $(NF-1) "." $NF}' | sort -u > "$P/root_domains.txt"
 sed 's/\.$//; s/^\*\.//' "$P/affiliate_hostnames.txt" | tr 'A-Z' 'a-z' \
   | awk -F. 'NF >= 2 {print $(NF-1) "." $NF}' | sort -u \

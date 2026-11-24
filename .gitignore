@@ -1,5 +1,24 @@
 # Engagement output - contains client attack surface & findings. Never commit.
 recon_*/
+01_passive/
+03_active/
+seeds.txt
+scope_all_ips.txt
+all_hostnames.txt
+scope_check.json
+inscope_*.txt
+out_of_scope_ips.txt
+out_of_scope_for_client.tsv
+active_targets.txt
+open_ports.txt
+hostnames_ips.txt
+seed_inscope_*.txt
+affiliate_*.txt
+root_domains.txt
+azmap_domains.txt
+crtsh_candidates.txt
+domains.txt
+domains.txt.bak
 *.bscope.json
 scope_report.xlsx
 out_of_scope_*.xlsx

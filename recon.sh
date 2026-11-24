@@ -38,7 +38,7 @@
 #                   seed prep (step 0) instead of the pipeline.
 #
 # Options:
-#   -o DIR          output directory (default: recon_<date>)
+#   -o DIR          output directory (default: the current directory)
 #   -c "Name"       client name for the landlord report
 #   -a "Name"       assessor/company name for the landlord report
 #   --gcp           also classify Google Cloud ranges in landlord
@@ -96,7 +96,13 @@ ACTIVE_CONFIG=(
 )
 declare -a SEEDS_IN=()
 
-err() { echo -e "$@" >&2; }
+# Messages show paths relative to the current directory, so they stay short and
+# copy-pasteable (".../recon/domains.txt" prints as "domains.txt").
+err() {
+  local m="$*"
+  [ "$PWD" != / ] && m=${m//"$PWD/"/}
+  echo -e "$m" >&2
+}
 die() { err "[!] $*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -156,15 +162,14 @@ have python3 || die "python3 not found."
 if [ "${#SEEDS_IN[@]}" -eq 0 ]; then
   have jq   || die "jq not found (needed for azmap / crt.sh parsing)."
   have curl || die "curl not found (needed for azmap / crt.sh lookups)."
-  OUT="${OUT:-recon_$(date +%Y%m%d)}"
-  PREP="$OUT/00_seed_prep"
-  mkdir -p "$PREP" || die "Could not create output dir: $PREP"
-  PREP=$(cd "$PREP" && pwd)
+  OUT="${OUT:-.}"
+  mkdir -p "$OUT" || die "Could not create output dir: $OUT"
+  PREP=$(cd "$OUT" && pwd)
 
   err "==================================================================="
   err " recon.sh - STEP 0  Seed prep (no -d given: starting from scope IPs)"
   err " Scope:  $SCOPE"
-  err " Output: $PREP"
+  echo " Output: $PREP" >&2
   err "==================================================================="
   err "[*] BBOT: hostnames + IPs for the scope (sslcert, shodan_idb, viewdns, rapiddns, hackertarget)"
   err "    sslcert connects to the scope IPs on TLS ports to read certificates."
@@ -181,8 +186,8 @@ if [ "${#SEEDS_IN[@]}" -eq 0 ]; then
   #                                    (CDN, cloud, SaaS, a name off a cert...)
   # Affiliate hostnames are still leads for the domain list; affiliate IPs are
   # out of scope and must not be tested without client sign-off.
-  IN_HOSTS="$PREP/inscope_hostnames.txt"
-  IN_IPS="$PREP/inscope_ips.txt"
+  IN_HOSTS="$PREP/seed_inscope_hostnames.txt"
+  IN_IPS="$PREP/seed_inscope_ips.txt"
   AFF_HOSTS="$PREP/affiliate_hostnames.txt"
   AFF_IPS="$PREP/affiliate_ips.txt"
   awk -F'\t' -v ih="$IN_HOSTS" -v ii="$IN_IPS" -v ah="$AFF_HOSTS" -v ai="$AFF_IPS" '
@@ -250,25 +255,45 @@ if [ "${#SEEDS_IN[@]}" -eq 0 ]; then
     | sort | uniq -c | sort -rn > "$CRTSH"
   err "[+] $(wc -l < "$CRTSH" | tr -d ' ') candidate root domain(s), most common first -> $CRTSH"
 
-  # Draft seed list: root domains from the IPs + tenant domains.
+  # Draft seed list: root domains from the IPs + tenant domains. Keep any
+  # existing domains.txt (e.g. one you already reviewed) as domains.txt.bak.
   DRAFT="$PREP/domains.txt"
+  if [ -s "$DRAFT" ]; then
+    cp "$DRAFT" "$DRAFT.bak"
+    err "[*] Existing domains.txt saved as domains.txt.bak"
+  fi
   sort -u "$ROOTS" "$AZMAP" | awk 'NF' > "$DRAFT"
+
+  n() { wc -l < "$1" | tr -d ' '; }
+  D=$(err "$DRAFT" 2>&1); A=$(err "$AFF_ROOTS" 2>&1); C=$(err "$CRTSH" 2>&1)
+  OUT_ARG=""; [ "$PREP" != "$PWD" ] && OUT_ARG=" -o \"$(err "$PREP" 2>&1)\""
 
   err ""
   err "==================================================================="
-  err " Seed prep done. Review before running the pipeline:"
-  err "   1. $DRAFT"
-  err "      in-scope root domains + M365 tenant domains. Remove anything"
-  err "      that isn't the client (hosting, CDN, shared-hosting neighbours)."
-  err "   2. $AFF_ROOTS"
-  err "      root domains of affiliate (out-of-scope) hostnames. Delete the ones"
-  err "      that aren't the client (CDN, cloud, SaaS), then append the keepers:"
-  err "        cat \"$AFF_ROOTS\" >> \"$DRAFT\" && sort -u -o \"$DRAFT\" \"$DRAFT\""
-  err "   3. $CRTSH"
-  err "      delete the lines you don't want, then append the keepers:"
-  err "        awk '{print \$2}' \"$CRTSH\" >> \"$DRAFT\" && sort -u -o \"$DRAFT\" \"$DRAFT\""
-  err "   4. Run the landlord pipeline with the reviewed domains:"
-  err "        $0 -s \"$SCOPE\" -d \"$DRAFT\" -o \"$OUT\""
+  err " Seed prep done. Nothing has been actively scanned yet."
+  err "==================================================================="
+  err ""
+  err " Review these files, then run the pipeline:"
+  err ""
+  err " 1. $D  ($(n "$DRAFT") domains)"
+  err "    In-scope root domains + M365 tenant domains. Remove anything that"
+  err "    isn't the client (hosting, CDN, shared-hosting neighbours)."
+  err ""
+  err " 2. $A  ($(n "$AFF_ROOTS") domains)"
+  err "    Root domains of out-of-scope hostnames. Delete the ones that aren't"
+  err "    the client (CDN, cloud, SaaS), then add the rest:"
+  err ""
+  err "      cat $A >> $D && sort -u -o $D $D"
+  err ""
+  err " 3. $C  ($(n "$CRTSH") domains, most common first)"
+  err "    Delete the lines you don't want, then add the rest:"
+  err ""
+  err "      awk '{print \$2}' $C >> $D && sort -u -o $D $D"
+  err ""
+  err " 4. Run the pipeline with the reviewed list:"
+  err ""
+  err "      $0 -s \"$SCOPE\" -d $D$OUT_ARG"
+  err ""
   err "==================================================================="
   exit 0
 fi
@@ -304,7 +329,7 @@ fi
 [ "$MODE" = passive ] && PASSIVE_ONLY=1
 err "[*] Scan mode: $MODE"
 
-OUT="${OUT:-recon_$(date +%Y%m%d)}"
+OUT="${OUT:-.}"
 mkdir -p "$OUT" || die "Could not create output dir: $OUT"
 OUT=$(cd "$OUT" && pwd)
 
@@ -362,7 +387,7 @@ SEED_COUNT=$(wc -l < "$SEEDS" | tr -d ' ')
 
 err "==================================================================="
 err " recon.sh - BBOT-only external recon"
-err " Output:   $OUT"
+echo " Output:   $OUT" >&2
 err " Scope:    $SCOPE"
 err " Seeds:    $SEED_COUNT domain(s) -> $SEEDS"
 err "==================================================================="
@@ -681,7 +706,7 @@ SHOTS_ARG=()
 
 err ""
 err "==================================================================="
-err " Done. Everything is in: $OUT"
+echo " Done. Everything is in: $OUT" >&2
 if [ "$MODE" != active ]; then
   err "   FOR THE CLIENT:"
   err "     Scope report (Excel)      : $LAND_XLSX"
